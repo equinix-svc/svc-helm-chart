@@ -57,7 +57,7 @@ client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
 The Day 0 file in svc-ne-byoi-builder (`day0/day0-ai-gateway.yaml`) generates these and downloads the file. Its
 optional parameters are `GROQ_API_KEY`, `GEMINI_API_KEY`, `LITELLM_MASTER_KEY`, `LANGFUSE_ADMIN_EMAIL`,
 `LANGFUSE_ADMIN_PASSWORD`, `STACK_REF` (branch or tag to fetch, default `main`) and `STACK_TOKEN` (read-only GitHub
-token, needed while the repo is private). Generated credentials are written to `/etc/ai-gateway/credentials.env`
+token, only for a private fork; the repo is public). Generated credentials are written to `/etc/ai-gateway/credentials.env`
 (root only).
 
 ## First start
