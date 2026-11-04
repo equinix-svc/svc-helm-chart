@@ -1,0 +1,905 @@
+# AI gateway stack for a single k3s node. Source template: scripts/build.py turns it into ai-gateway.yaml
+# (every "@@FILE path@@" line is replaced by that file, indented as the marker is).
+#
+# Drop the generated ai-gateway.yaml into /var/lib/rancher/k3s/server/manifests/ (or kubectl apply it). k3s's
+# built-in Helm controller installs the three HelmChart resources; everything else is plain Kubernetes.
+# Secrets are NOT in this file: Day 0 creates Secrets ai-secrets and litellm-env first (see README.md).
+#
+#   LiteLLM  -> Presidio (PII), LLM Guard (injection, secrets), rag-service -> Qdrant + S3, Langfuse (traces)
+#   Postgres (litellm, langfuse), Redis, ClickHouse (Langfuse), SeaweedFS S3 (from the Langfuse chart)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-gateway
+---
+# ---------------------------------------------------------------------------------------------------------
+# Shared data services (official images)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: ai-gateway
+data:
+  10-langfuse-db.sql: |
+    CREATE DATABASE langfuse;
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: postgres-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: postgres, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_DB, value: litellm }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: [sh, -c, 'pg_isready -U "$POSTGRES_USER" -d litellm'] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: postgres-data } }
+        - { name: init, configMap: { name: postgres-init } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: ai-gateway }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+# One Redis for LiteLLM (router state, opt-in cache) and Langfuse (queues); Langfuse needs noeviction.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: redis-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: [sh, -c, 'exec redis-server --requirepass "$REDIS_PASSWORD" --maxmemory-policy noeviction --appendonly yes']
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: [sh, -c, 'redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG'] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: redis-data } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: ai-gateway }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
+---
+# Single ClickHouse for Langfuse (the chart's own ClickHouse needs an operator and a 3-node Keeper).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: clickhouse-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: clickhouse, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: clickhouse } }
+  template:
+    metadata: { labels: { app: clickhouse } }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:26.8.36.3
+          env:
+            - { name: CLICKHOUSE_DB, value: default }
+            - { name: CLICKHOUSE_USER, value: default }
+            - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: CLICKHOUSE_PASSWORD } }
+          ports: [{ containerPort: 8123 }, { containerPort: 9000 }]
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 200m, memory: 1Gi }
+            limits: { memory: 3Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/clickhouse }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: clickhouse-data } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: clickhouse, namespace: ai-gateway }
+spec:
+  selector: { app: clickhouse }
+  ports:
+    - { name: http, port: 8123 }
+    - { name: native, port: 9000 }
+---
+# ---------------------------------------------------------------------------------------------------------
+# Guardrails and RAG (stock images; code from ConfigMaps; Python packages installed once into a volume)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: presidio-analyzer, namespace: ai-gateway }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: presidio-analyzer } }
+  template:
+    metadata: { labels: { app: presidio-analyzer } }
+    spec:
+      containers:
+        - name: presidio-analyzer
+          image: mcr.microsoft.com/presidio-analyzer:latest
+          ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 600Mi }
+            limits: { memory: 1500Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: presidio-analyzer, namespace: ai-gateway }
+spec:
+  selector: { app: presidio-analyzer }
+  ports: [{ port: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: presidio-anonymizer, namespace: ai-gateway }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: presidio-anonymizer } }
+  template:
+    metadata: { labels: { app: presidio-anonymizer } }
+    spec:
+      containers:
+        - name: presidio-anonymizer
+          image: mcr.microsoft.com/presidio-anonymizer:latest
+          ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: presidio-anonymizer, namespace: ai-gateway }
+spec:
+  selector: { app: presidio-anonymizer }
+  ports: [{ port: 3000 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: llm-guard-app, namespace: ai-gateway }
+data:
+  app.py: |
+    """LLM Guard service for the LiteLLM guardrail (litellm/llm_guard_guardrail.py).
+
+    POST /scan/prompt   {"text": ...} -> {"block": bool, "risk": float, "reason": str}
+    POST /scan/secrets  {"text": ...} -> {"found": bool, "text": <redacted text>}
+
+    Scanner logic is carried over unchanged from the earlier lab's llm-guard adapter: DeBERTa v3 must flag the text AND
+    explicit injection vocabulary must be present, because DeBERTa alone scores many benign instruction-shaped phrases
+    near 1.0. Only the Portkey webhook contract and the metrics hook were dropped.
+    """
+    import os
+    import re
+
+    import torch
+    from fastapi import FastAPI
+    from llm_guard.input_scanners import PromptInjection, Secrets
+    from llm_guard.input_scanners.prompt_injection import MatchType
+
+    app = FastAPI()
+
+    # One thread per vCPU stalls at the thread barrier when another process holds a core; leave headroom.
+    torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "4")))
+
+    # SENTENCE: a small payload hidden in a long legitimate document is diluted when the whole text is scored at once.
+    injection_scanner = PromptInjection(match_type=MatchType.SENTENCE)
+    secrets_scanner = Secrets()
+
+    INJECTION_SIGNALS = [
+        'ignore previous instructions', 'ignore all previous', 'ignore your instructions',
+        'disregard your', 'forget your instructions', 'forget your previous',
+        'override your instructions', 'system prompt', 'you are now',
+        'act as a ', 'act as an ', 'pretend you have', 'pretend to be',
+        'jailbreak', 'no restrictions', 'no rules', 'uncensored', 'unrestricted ai',
+        'system override', 'developer mode', 'admin override',
+        'bypass your', 'break character', 'reveal your system', 'new instructions:',
+    ]
+    INJECTION_PATTERNS = [
+        re.compile(p, re.I | re.S) for p in (
+            r"\bignore\b[^.\n]{0,40}\b(task|tasks|instruction|instructions|rules?|prompt|guidelines?|previous|above|everything)\b",
+            r"\b(note|message|instruction|comment)s?\s+(for|to)\s+(the\s+)?(ai|llm|assistant|model|chatbot)\b",
+            r"\b(ai|llm)\s+assistant\s*[:,]",
+            r"\b(print|output|reveal|show|send|email|leak|dump|exfiltrate|list)\b[^.\n]{0,60}\b(env(ironment)?\s+variables?|api\s+keys?|secrets?|credentials?|passwords?|\.env|tokens?)\b",
+            r"\binstead,?\s+(output|print|reveal|show|say|send)\b",
+        )
+    ]
+
+
+    def has_signals(text: str) -> bool:
+        lower = text.lower()
+        return any(s in lower for s in INJECTION_SIGNALS) or any(p.search(text) for p in INJECTION_PATTERNS)
+
+
+    @app.get("/healthz")
+    def healthz():
+        return {"ok": True}
+
+
+    @app.post("/scan/prompt")
+    def scan_prompt(payload: dict):
+        text = payload.get("text") or ""
+        if not text:
+            return {"block": False, "risk": 0.0, "reason": ""}
+        _, is_valid, risk = injection_scanner.scan(text)
+        block = (not is_valid) and has_signals(text)
+        return {"block": block, "risk": risk, "reason": f"prompt injection (risk {round(risk * 100)}%)" if block else ""}
+
+
+    @app.post("/scan/secrets")
+    def scan_secrets(payload: dict):
+        text = payload.get("text") or ""
+        if not text:
+            return {"found": False, "text": text}
+        sanitized, is_valid, _ = secrets_scanner.scan(text)
+        return {"found": not is_valid, "text": sanitized}
+  requirements.txt: |
+    fastapi==0.115.6
+    uvicorn==0.32.1
+    llm-guard==0.3.16
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: llm-guard-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 8Gi } }
+---
+# First start installs CPU-only PyTorch + llm-guard into /data/venv and downloads the DeBERTa v3 weights into
+# /data/hf (about 10 minutes, a few GB). Later restarts reuse the volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: llm-guard, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: llm-guard } }
+  template:
+    metadata: { labels: { app: llm-guard } }
+    spec:
+      containers:
+        - name: llm-guard
+          image: python:3.12-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ ! -x /data/venv/bin/uvicorn ]; then
+                python -m venv /data/venv
+                /data/venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+                /data/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+              fi
+              exec /data/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+          env:
+            - { name: HF_HOME, value: /data/hf }
+            - { name: TORCH_NUM_THREADS, value: "4" }
+          ports: [{ containerPort: 8000 }]
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 180      # up to 30 minutes for the first install and model download
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 200m, memory: 1Gi }
+            limits: { memory: 3Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: app, mountPath: /app }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: llm-guard-data } }
+        - { name: app, configMap: { name: llm-guard-app } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: llm-guard, namespace: ai-gateway }
+spec:
+  selector: { app: llm-guard }
+  ports: [{ port: 8000 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: rag-service-app, namespace: ai-gateway }
+data:
+  app.py: |
+    """RAG service: embeds in-process (fastembed ONNX), stores in Qdrant, reads source documents from the S3 store (SeaweedFS).
+
+    POST /retrieve {"query": str, "top_k": int}          -> chunks for the LiteLLM rag_augment guardrail
+    POST /ingest   {"bucket": "rag-docs", "prefix": ""}  -> chunk + embed every .txt / .md object into Qdrant
+
+    Derived from the earlier lab's rag-adapter (same chunking and Qdrant search), with Ollama and Gemini embeddings
+    replaced by a local model and the Portkey webhook contract dropped.
+    """
+    import os
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    import httpx
+    from fastapi import FastAPI
+    from fastembed import TextEmbedding
+
+    QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge-base")
+    MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    DIM = 384
+    CHUNK_CHARS = 1800
+
+    app = FastAPI()
+    embedder = TextEmbedding(MODEL)
+
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [v.tolist() for v in embedder.embed(texts)]
+
+
+    def s3():
+        return boto3.client(
+            "s3", endpoint_url=os.environ["S3_ENDPOINT"],
+            aws_access_key_id=os.environ["S3_ACCESS_KEY"], aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+            region_name="us-east-1", config=Config(s3={"addressing_style": "path"}),
+        )
+
+
+    def ensure_collection(client: httpx.Client) -> None:
+        if client.get(f"{QDRANT_URL}/collections/{COLLECTION}").status_code == 200:
+            return
+        client.put(f"{QDRANT_URL}/collections/{COLLECTION}",
+                   json={"vectors": {"size": DIM, "distance": "Cosine"}}).raise_for_status()
+
+
+    def chunks_of(text: str) -> list[str]:
+        out, cur = [], ""
+        for para in text.split("\n\n"):
+            if cur and len(cur) + len(para) > CHUNK_CHARS:
+                out.append(cur.strip())
+                cur = ""
+            cur += para + "\n\n"
+        if cur.strip():
+            out.append(cur.strip())
+        return out
+
+
+    @app.get("/healthz")
+    def healthz():
+        return {"ok": True}
+
+
+    @app.post("/retrieve")
+    def retrieve(payload: dict):
+        query, top_k = payload.get("query") or "", int(payload.get("top_k") or 3)
+        if not query:
+            return {"chunks": []}
+        with httpx.Client(timeout=10) as client:
+            r = client.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+                            json={"vector": embed([query])[0], "limit": top_k, "with_payload": True})
+            if r.status_code == 404:  # collection not created yet: nothing ingested
+                return {"chunks": []}
+            r.raise_for_status()
+            return {"chunks": [
+                {"text": p["payload"]["text"], "source": p["payload"].get("source", "?"), "score": round(float(p["score"]), 3)}
+                for p in r.json().get("result", []) if p.get("payload", {}).get("text")
+            ]}
+
+
+    @app.post("/ingest")
+    def ingest(payload: dict):
+        bucket, prefix = payload.get("bucket", "rag-docs"), payload.get("prefix", "")
+        client_s3, done = s3(), []
+        with httpx.Client(timeout=60) as client:
+            ensure_collection(client)
+            for page in client_s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if not key.lower().endswith((".txt", ".md")):
+                        continue
+                    text = client_s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8", "replace")
+                    parts = chunks_of(text)
+                    if not parts:
+                        continue
+                    points = [
+                        {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{bucket}/{key}#{i}")), "vector": v,
+                         "payload": {"text": t, "source": key, "chunk": i}}
+                        for i, (t, v) in enumerate(zip(parts, embed(parts)))
+                    ]
+                    client.put(f"{QDRANT_URL}/collections/{COLLECTION}/points?wait=true",
+                               json={"points": points}).raise_for_status()
+                    done.append({"source": key, "chunks": len(points)})
+        return {"ingested": done}
+  requirements.txt: |
+    fastapi==0.115.6
+    uvicorn==0.32.1
+    httpx==0.27.2
+    fastembed==0.4.2
+    boto3==1.35.90
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rag-service-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 3Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: rag-service, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: rag-service } }
+  template:
+    metadata: { labels: { app: rag-service } }
+    spec:
+      containers:
+        - name: rag-service
+          image: python:3.12-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ ! -x /data/venv/bin/uvicorn ]; then
+                python -m venv /data/venv
+                /data/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+              fi
+              exec /data/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+          env:
+            - { name: FASTEMBED_CACHE_PATH, value: /data/models }
+            - { name: QDRANT_URL, value: "http://qdrant:6333" }
+            - { name: S3_ENDPOINT, value: "http://langfuse-s3-all-in-one:8333" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: langfuse-s3-auth, key: accessKey } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: langfuse-s3-auth, key: secretKey } }
+          ports: [{ containerPort: 8000 }]
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 300Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: app, mountPath: /app }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: rag-service-data } }
+        - { name: app, configMap: { name: rag-service-app } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rag-service, namespace: ai-gateway }
+spec:
+  selector: { app: rag-service }
+  ports: [{ port: 8000 }]
+---
+# LiteLLM guardrail modules, mounted next to the proxy config (see the litellm HelmChart below)
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: litellm-guardrails, namespace: ai-gateway }
+data:
+  llm_guard_guardrail.py: |
+    """llm_guard_guardrail.py - LiteLLM guardrail backed by the in-cluster llm-guard service.
+
+    pre_call : prompt-injection check on the last user message (blocks with HTTP 400) and secrets redaction on every
+               string message.
+    post_call: secrets redaction on the model reply.
+    If the llm-guard service is unreachable the request passes unchanged (fail open, logged).
+    """
+    import os
+
+    import httpx
+    from fastapi import HTTPException
+
+    from litellm._logging import verbose_proxy_logger
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+
+    URL = os.environ.get("LLM_GUARD_URL", "http://llm-guard:8000")
+    TIMEOUT = float(os.environ.get("LLM_GUARD_TIMEOUT", "10"))
+
+
+    async def _post(path: str, text: str) -> dict:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.post(f"{URL}{path}", json={"text": text})
+            r.raise_for_status()
+            return r.json()
+
+
+    class LlmGuardGuardrail(CustomGuardrail):
+        async def async_pre_call_hook(self, user_api_key_dict, cache, data: dict, call_type):
+            messages = data.get("messages") or []
+            try:
+                last = next((m for m in reversed(messages)
+                             if m.get("role") == "user" and isinstance(m.get("content"), str)), None)
+                if last:
+                    verdict = await _post("/scan/prompt", last["content"])
+                    if verdict.get("block"):
+                        raise HTTPException(status_code=400, detail=f"llm-guard BLOCKED: {verdict.get('reason')}")
+                for m in messages:
+                    if isinstance(m.get("content"), str):
+                        res = await _post("/scan/secrets", m["content"])
+                        if res.get("found"):
+                            m["content"] = res["text"]
+            except HTTPException:
+                raise
+            except Exception as exc:
+                verbose_proxy_logger.warning("llm-guard unavailable, request passed unchecked: %s", exc)
+            return data
+
+        async def async_post_call_success_hook(self, data: dict, user_api_key_dict, response):
+            try:
+                for choice in getattr(response, "choices", None) or []:
+                    msg = getattr(choice, "message", None)
+                    if msg is not None and isinstance(msg.content, str):
+                        res = await _post("/scan/secrets", msg.content)
+                        if res.get("found"):
+                            msg.content = res["text"]
+            except Exception as exc:
+                verbose_proxy_logger.warning("llm-guard unavailable, reply passed unchecked: %s", exc)
+            return response
+  rag_augment.py: |
+    """rag_augment.py - LiteLLM pre-call guardrail: retrieve top-k chunks from the in-cluster rag-service and prepend
+    them as a system message. Opt-in per request ("guardrails": ["rag-augment"]). Retrieval failure never blocks the call.
+    """
+    import os
+
+    import httpx
+
+    from litellm._logging import verbose_proxy_logger
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+
+    URL = os.environ.get("RAG_URL", "http://rag-service:8000")
+    TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
+    MAX_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "6000"))
+
+
+    class RagAugmentGuardrail(CustomGuardrail):
+        async def async_pre_call_hook(self, user_api_key_dict, cache, data: dict, call_type):
+            messages = list(data.get("messages") or [])
+            query = next((m["content"] for m in reversed(messages)
+                          if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+            if not query:
+                return data
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    r = await client.post(f"{URL}/retrieve", json={"query": query, "top_k": TOP_K})
+                    r.raise_for_status()
+                    chunks = r.json().get("chunks", [])
+            except Exception as exc:
+                verbose_proxy_logger.warning("RAG retrieval failed, continuing without context: %s", exc)
+                return data
+            parts, total = [], 0
+            for i, c in enumerate(chunks):
+                if total + len(c["text"]) > MAX_CHARS:
+                    break
+                parts.append(f"[Context {i + 1}] ({c['source']}): {c['text']}")
+                total += len(c["text"])
+            if parts:
+                data["messages"] = [{"role": "system", "content": "Retrieved context:\n\n" + "\n\n".join(parts)}, *messages]
+            return data
+---
+# LiteLLM is the only service exposed outside the cluster (Traefik, any host name).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: litellm
+  namespace: ai-gateway
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: ai-litellm, port: { number: 4000 } } }
+---
+# ---------------------------------------------------------------------------------------------------------
+# Helm charts (installed by the k3s Helm controller; versions pinned)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: qdrant, namespace: kube-system }
+spec:
+  repo: https://qdrant.github.io/qdrant-helm
+  chart: qdrant
+  version: 1.20.0
+  targetNamespace: ai-gateway
+  valuesContent: |-
+    fullnameOverride: qdrant
+    replicaCount: 1
+    persistence:
+      size: 5Gi
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 1Gi }
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: langfuse, namespace: kube-system }
+spec:
+  repo: https://langfuse.github.io/langfuse-k8s
+  chart: langfuse
+  version: 2.2.3
+  targetNamespace: ai-gateway
+  timeout: 20m
+  valuesContent: |-
+    # Langfuse on one node. Postgres, Redis and ClickHouse are the plain Deployments in ai-gateway.yaml; only the
+    # SeaweedFS S3 store comes from the chart. Secrets come from Secret ai-secrets (created by Day 0); the S3 password is generated by the chart.
+    fullnameOverride: langfuse
+    langfuse:
+      salt:
+        secretKeyRef: { name: ai-secrets, key: LANGFUSE_SALT }
+      encryptionKey:
+        secretKeyRef: { name: ai-secrets, key: LANGFUSE_ENCRYPTION_KEY }
+      nextauth:
+        url: http://localhost:3000
+        secret:
+          secretKeyRef: { name: ai-secrets, key: LANGFUSE_NEXTAUTH_SECRET }
+      # First user, organisation and project (with API keys) created at startup
+      additionalEnv:
+        - { name: LANGFUSE_INIT_ORG_ID, value: ai-gateway }
+        - { name: LANGFUSE_INIT_ORG_NAME, value: AI Gateway }
+        - { name: LANGFUSE_INIT_PROJECT_ID, value: ai-gateway }
+        - { name: LANGFUSE_INIT_PROJECT_NAME, value: ai-gateway }
+        - { name: LANGFUSE_INIT_USER_NAME, value: admin }
+        - name: LANGFUSE_INIT_USER_EMAIL
+          valueFrom: { secretKeyRef: { name: ai-secrets, key: LANGFUSE_INIT_USER_EMAIL } }
+        - name: LANGFUSE_INIT_USER_PASSWORD
+          valueFrom: { secretKeyRef: { name: ai-secrets, key: LANGFUSE_INIT_USER_PASSWORD } }
+        - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+          valueFrom: { secretKeyRef: { name: ai-secrets, key: LANGFUSE_PUBLIC_KEY } }
+        - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
+          valueFrom: { secretKeyRef: { name: ai-secrets, key: LANGFUSE_SECRET_KEY } }
+      features:
+        telemetryEnabled: false
+      web:
+        image: { pullPolicy: IfNotPresent }
+        resources:
+          requests: { cpu: 100m, memory: 512Mi }
+          limits: { memory: 1500Mi }
+      worker:
+        image: { pullPolicy: IfNotPresent }
+        resources:
+          requests: { cpu: 100m, memory: 384Mi }
+          limits: { memory: 1500Mi }
+
+    postgresql:
+      deploy: false
+      host: postgres
+      port: 5432
+      auth:
+        username: ai
+        database: langfuse
+        existingSecret: ai-secrets
+        secretKeys:
+          userPasswordKey: POSTGRES_PASSWORD
+
+    redis:
+      deploy: false
+      host: redis
+      port: 6379
+      auth:
+        username: default
+        existingSecret: ai-secrets
+        existingSecretPasswordKey: REDIS_PASSWORD
+
+    clickhouse:
+      deploy: false
+      crdCheck: false
+      host: clickhouse
+      auth:
+        username: default
+        existingSecret: ai-secrets
+        existingSecretKey: CLICKHOUSE_PASSWORD
+      cluster:
+        enabled: false
+
+    s3:
+      deploy: true
+      bucket: langfuse
+      auth:
+        rootUser: langfuse        # the chart generates and keeps the password in Secret langfuse-s3-auth
+      defaultBuckets: langfuse
+      allInOne:
+        s3:
+          createBuckets:
+            - name: langfuse
+            - name: rag-docs
+        data:
+          size: 20Gi
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits: { memory: 1Gi }
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: ai, namespace: kube-system }
+spec:
+  chart: oci://ghcr.io/berriai/litellm-helm
+  version: 1.108.0
+  targetNamespace: ai-gateway
+  timeout: 20m
+  valuesContent: |-
+    # LiteLLM proxy. Release name "ai" -> Service ai-litellm:4000. Database, keys and API keys come from existing
+    # Secrets (ai-secrets, litellm-env), created by Day 0.
+    image:
+      pullPolicy: IfNotPresent
+    db:
+      useExisting: true
+      deployStandalone: false
+      endpoint: postgres
+      database: litellm
+      secret:
+        name: ai-secrets
+        usernameKey: POSTGRES_USER
+        passwordKey: POSTGRES_PASSWORD
+    masterkeySecretName: litellm-env
+    masterkeySecretKey: LITELLM_MASTER_KEY
+    environmentSecrets:
+      - litellm-env
+    envVars:
+      STORE_MODEL_IN_DB: "True"
+      PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
+      PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
+      LLM_GUARD_URL: http://llm-guard:8000
+      RAG_URL: http://rag-service:8000
+      LANGFUSE_HOST: http://langfuse-web:3000
+    resources:
+      requests: { cpu: 200m, memory: 512Mi }
+      limits: { memory: 2Gi }
+    volumes:
+      - name: guardrails
+        configMap: { name: litellm-guardrails }
+    volumeMounts:
+      - { name: guardrails, mountPath: /etc/litellm/llm_guard_guardrail.py, subPath: llm_guard_guardrail.py }
+      - { name: guardrails, mountPath: /etc/litellm/rag_augment.py, subPath: rag_augment.py }
+    proxy_config:
+      model_list:
+        - model_name: groq-qwen
+          litellm_params:
+            model: groq/qwen/qwen3.8-27b
+            api_key: os.environ/GROQ_API_KEY
+        - model_name: gemini-flash
+          litellm_params:
+            model: gemini/gemini-3.5-flash-lite
+            api_key: os.environ/GEMINI_API_KEY
+        # Pool: one virtual name, usage-based routing across both hosted backends.
+        - model_name: llm-pool
+          litellm_params:
+            model: groq/qwen/qwen3.8-27b
+            api_key: os.environ/GROQ_API_KEY
+        - model_name: llm-pool
+          litellm_params:
+            model: gemini/gemini-3.5-flash-lite
+            api_key: os.environ/GEMINI_API_KEY
+
+      guardrails:
+        # Order matters: RAG sees the original prompt, LLM Guard blocks injections and redacts secrets, then Presidio masks PII.
+        - guardrail_name: rag-augment
+          litellm_params:
+            guardrail: rag_augment.RagAugmentGuardrail
+            mode: pre_call
+            default_on: false          # opt-in per request: "guardrails": ["rag-augment"]
+        - guardrail_name: llm-guard
+          litellm_params:
+            guardrail: llm_guard_guardrail.LlmGuardGuardrail
+            mode: [pre_call, post_call]
+            default_on: true
+        - guardrail_name: presidio-pre-call
+          litellm_params:
+            guardrail: presidio
+            mode: pre_call
+            default_on: true
+            pii_entities_config: &pii
+              CREDIT_CARD: MASK
+              EMAIL_ADDRESS: MASK
+              PHONE_NUMBER: MASK
+              US_SSN: MASK
+              PERSON: MASK
+              IBAN_CODE: MASK
+        - guardrail_name: presidio-post-call
+          litellm_params:
+            guardrail: presidio
+            mode: post_call
+            default_on: true
+            pii_entities_config: *pii
+
+      litellm_settings:
+        set_verbose: false
+        # Exact-match response cache, opt-in per request ("cache": {"use-cache": true}).
+        cache: true
+        cache_params:
+          type: redis
+          host: redis
+          port: 6379
+          password: os.environ/REDIS_PASSWORD
+          ttl: 600
+          mode: default_off
+          supported_call_types: ["acompletion", "completion"]
+        success_callback: ["langfuse"]
+        failure_callback: ["langfuse"]
+
+      general_settings:
+        master_key: os.environ/LITELLM_MASTER_KEY
+
+      router_settings:
+        redis_host: redis
+        redis_port: 6379
+        redis_password: os.environ/REDIS_PASSWORD
+        routing_strategy: usage-based-routing
+        enable_pre_call_check: false

@@ -1,0 +1,440 @@
+# AI gateway stack for a single k3s node. Source template: scripts/build.py turns it into ai-gateway.yaml
+# (every "@@FILE path@@" line is replaced by that file, indented as the marker is).
+#
+# Drop the generated ai-gateway.yaml into /var/lib/rancher/k3s/server/manifests/ (or kubectl apply it). k3s's
+# built-in Helm controller installs the three HelmChart resources; everything else is plain Kubernetes.
+# Secrets are NOT in this file: Day 0 creates Secrets ai-secrets and litellm-env first (see README.md).
+#
+#   LiteLLM  -> Presidio (PII), LLM Guard (injection, secrets), rag-service -> Qdrant + S3, Langfuse (traces)
+#   Postgres (litellm, langfuse), Redis, ClickHouse (Langfuse), SeaweedFS S3 (from the Langfuse chart)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-gateway
+---
+# ---------------------------------------------------------------------------------------------------------
+# Shared data services (official images)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: ai-gateway
+data:
+  10-langfuse-db.sql: |
+    CREATE DATABASE langfuse;
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: postgres-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: postgres, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_DB, value: litellm }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: [sh, -c, 'pg_isready -U "$POSTGRES_USER" -d litellm'] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: postgres-data } }
+        - { name: init, configMap: { name: postgres-init } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: ai-gateway }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+# One Redis for LiteLLM (router state, opt-in cache) and Langfuse (queues); Langfuse needs noeviction.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: redis-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: [sh, -c, 'exec redis-server --requirepass "$REDIS_PASSWORD" --maxmemory-policy noeviction --appendonly yes']
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: [sh, -c, 'redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG'] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: redis-data } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: ai-gateway }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
+---
+# Single ClickHouse for Langfuse (the chart's own ClickHouse needs an operator and a 3-node Keeper).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: clickhouse-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: clickhouse, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: clickhouse } }
+  template:
+    metadata: { labels: { app: clickhouse } }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:26.8.36.3
+          env:
+            - { name: CLICKHOUSE_DB, value: default }
+            - { name: CLICKHOUSE_USER, value: default }
+            - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: ai-secrets, key: CLICKHOUSE_PASSWORD } }
+          ports: [{ containerPort: 8123 }, { containerPort: 9000 }]
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 200m, memory: 1Gi }
+            limits: { memory: 3Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/clickhouse }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: clickhouse-data } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: clickhouse, namespace: ai-gateway }
+spec:
+  selector: { app: clickhouse }
+  ports:
+    - { name: http, port: 8123 }
+    - { name: native, port: 9000 }
+---
+# ---------------------------------------------------------------------------------------------------------
+# Guardrails and RAG (stock images; code from ConfigMaps; Python packages installed once into a volume)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: presidio-analyzer, namespace: ai-gateway }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: presidio-analyzer } }
+  template:
+    metadata: { labels: { app: presidio-analyzer } }
+    spec:
+      containers:
+        - name: presidio-analyzer
+          image: mcr.microsoft.com/presidio-analyzer:latest
+          ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 600Mi }
+            limits: { memory: 1500Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: presidio-analyzer, namespace: ai-gateway }
+spec:
+  selector: { app: presidio-analyzer }
+  ports: [{ port: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: presidio-anonymizer, namespace: ai-gateway }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: presidio-anonymizer } }
+  template:
+    metadata: { labels: { app: presidio-anonymizer } }
+    spec:
+      containers:
+        - name: presidio-anonymizer
+          image: mcr.microsoft.com/presidio-anonymizer:latest
+          ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: presidio-anonymizer, namespace: ai-gateway }
+spec:
+  selector: { app: presidio-anonymizer }
+  ports: [{ port: 3000 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: llm-guard-app, namespace: ai-gateway }
+data:
+  app.py: |
+    @@FILE src/llm-guard/app.py@@
+  requirements.txt: |
+    @@FILE src/llm-guard/requirements.txt@@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: llm-guard-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 8Gi } }
+---
+# First start installs CPU-only PyTorch + llm-guard into /data/venv and downloads the DeBERTa v3 weights into
+# /data/hf (about 10 minutes, a few GB). Later restarts reuse the volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: llm-guard, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: llm-guard } }
+  template:
+    metadata: { labels: { app: llm-guard } }
+    spec:
+      containers:
+        - name: llm-guard
+          image: python:3.12-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ ! -x /data/venv/bin/uvicorn ]; then
+                python -m venv /data/venv
+                /data/venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+                /data/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+              fi
+              exec /data/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+          env:
+            - { name: HF_HOME, value: /data/hf }
+            - { name: TORCH_NUM_THREADS, value: "4" }
+          ports: [{ containerPort: 8000 }]
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 180      # up to 30 minutes for the first install and model download
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 200m, memory: 1Gi }
+            limits: { memory: 3Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: app, mountPath: /app }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: llm-guard-data } }
+        - { name: app, configMap: { name: llm-guard-app } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: llm-guard, namespace: ai-gateway }
+spec:
+  selector: { app: llm-guard }
+  ports: [{ port: 8000 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: rag-service-app, namespace: ai-gateway }
+data:
+  app.py: |
+    @@FILE src/rag-service/app.py@@
+  requirements.txt: |
+    fastapi==0.115.6
+    uvicorn==0.32.1
+    httpx==0.27.2
+    fastembed==0.4.2
+    boto3==1.35.90
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rag-service-data, namespace: ai-gateway }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 3Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: rag-service, namespace: ai-gateway }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: rag-service } }
+  template:
+    metadata: { labels: { app: rag-service } }
+    spec:
+      containers:
+        - name: rag-service
+          image: python:3.12-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ ! -x /data/venv/bin/uvicorn ]; then
+                python -m venv /data/venv
+                /data/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+              fi
+              exec /data/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+          env:
+            - { name: FASTEMBED_CACHE_PATH, value: /data/models }
+            - { name: QDRANT_URL, value: "http://qdrant:6333" }
+            - { name: S3_ENDPOINT, value: "http://langfuse-s3-all-in-one:8333" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: langfuse-s3-auth, key: accessKey } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: langfuse-s3-auth, key: secretKey } }
+          ports: [{ containerPort: 8000 }]
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 300Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: app, mountPath: /app }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: rag-service-data } }
+        - { name: app, configMap: { name: rag-service-app } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rag-service, namespace: ai-gateway }
+spec:
+  selector: { app: rag-service }
+  ports: [{ port: 8000 }]
+---
+# LiteLLM guardrail modules, mounted next to the proxy config (see the litellm HelmChart below)
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: litellm-guardrails, namespace: ai-gateway }
+data:
+  llm_guard_guardrail.py: |
+    @@FILE src/litellm/llm_guard_guardrail.py@@
+  rag_augment.py: |
+    @@FILE src/litellm/rag_augment.py@@
+---
+# LiteLLM is the only service exposed outside the cluster (Traefik, any host name).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: litellm
+  namespace: ai-gateway
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: ai-litellm, port: { number: 4000 } } }
+---
+# ---------------------------------------------------------------------------------------------------------
+# Helm charts (installed by the k3s Helm controller; versions pinned)
+# ---------------------------------------------------------------------------------------------------------
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: qdrant, namespace: kube-system }
+spec:
+  repo: https://qdrant.github.io/qdrant-helm
+  chart: qdrant
+  version: 1.20.0
+  targetNamespace: ai-gateway
+  valuesContent: |-
+    fullnameOverride: qdrant
+    replicaCount: 1
+    persistence:
+      size: 5Gi
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 1Gi }
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: langfuse, namespace: kube-system }
+spec:
+  repo: https://langfuse.github.io/langfuse-k8s
+  chart: langfuse
+  version: 2.2.3
+  targetNamespace: ai-gateway
+  timeout: 20m
+  valuesContent: |-
+    @@FILE src/values/langfuse.yaml@@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: { name: ai, namespace: kube-system }
+spec:
+  chart: oci://ghcr.io/berriai/litellm-helm
+  version: 1.108.0
+  targetNamespace: ai-gateway
+  timeout: 20m
+  valuesContent: |-
+    @@FILE src/values/litellm.yaml@@

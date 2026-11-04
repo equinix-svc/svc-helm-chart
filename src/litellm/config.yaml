@@ -1,0 +1,74 @@
+model_list:
+  - model_name: groq-qwen
+    litellm_params:
+      model: groq/qwen/qwen3.8-27b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+  # Pool: one virtual name, usage-based routing across both hosted backends.
+  - model_name: llm-pool
+    litellm_params:
+      model: groq/qwen/qwen3.8-27b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: llm-pool
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+
+guardrails:
+  # Order matters: RAG sees the original prompt, LLM Guard blocks injections and redacts secrets, then Presidio masks PII.
+  - guardrail_name: rag-augment
+    litellm_params:
+      guardrail: rag_augment.RagAugmentGuardrail
+      mode: pre_call
+      default_on: false          # opt-in per request: "guardrails": ["rag-augment"]
+  - guardrail_name: llm-guard
+    litellm_params:
+      guardrail: llm_guard_guardrail.LlmGuardGuardrail
+      mode: [pre_call, post_call]
+      default_on: true
+  - guardrail_name: presidio-pre-call
+    litellm_params:
+      guardrail: presidio
+      mode: pre_call
+      default_on: true
+      pii_entities_config: &pii
+        CREDIT_CARD: MASK
+        EMAIL_ADDRESS: MASK
+        PHONE_NUMBER: MASK
+        US_SSN: MASK
+        PERSON: MASK
+        IBAN_CODE: MASK
+  - guardrail_name: presidio-post-call
+    litellm_params:
+      guardrail: presidio
+      mode: post_call
+      default_on: true
+      pii_entities_config: *pii
+
+litellm_settings:
+  set_verbose: false
+  # Exact-match response cache, opt-in per request ("cache": {"use-cache": true}).
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/REDIS_PASSWORD
+    ttl: 600
+    mode: default_off
+    supported_call_types: ["acompletion", "completion"]
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+router_settings:
+  redis_host: redis
+  redis_port: 6379
+  redis_password: os.environ/REDIS_PASSWORD
+  routing_strategy: usage-based-routing
+  enable_pre_call_check: false

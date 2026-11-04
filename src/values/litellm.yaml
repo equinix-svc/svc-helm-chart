@@ -1,0 +1,35 @@
+# LiteLLM proxy. Release name "ai" -> Service ai-litellm:4000. Database, keys and API keys come from existing
+# Secrets (ai-secrets, litellm-env), created by Day 0.
+image:
+  pullPolicy: IfNotPresent
+db:
+  useExisting: true
+  deployStandalone: false
+  endpoint: postgres
+  database: litellm
+  secret:
+    name: ai-secrets
+    usernameKey: POSTGRES_USER
+    passwordKey: POSTGRES_PASSWORD
+masterkeySecretName: litellm-env
+masterkeySecretKey: LITELLM_MASTER_KEY
+environmentSecrets:
+  - litellm-env
+envVars:
+  STORE_MODEL_IN_DB: "True"
+  PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
+  PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
+  LLM_GUARD_URL: http://llm-guard:8000
+  RAG_URL: http://rag-service:8000
+  LANGFUSE_HOST: http://langfuse-web:3000
+resources:
+  requests: { cpu: 200m, memory: 512Mi }
+  limits: { memory: 2Gi }
+volumes:
+  - name: guardrails
+    configMap: { name: litellm-guardrails }
+volumeMounts:
+  - { name: guardrails, mountPath: /etc/litellm/llm_guard_guardrail.py, subPath: llm_guard_guardrail.py }
+  - { name: guardrails, mountPath: /etc/litellm/rag_augment.py, subPath: rag_augment.py }
+proxy_config:
+  @@FILE src/litellm/config.yaml@@
