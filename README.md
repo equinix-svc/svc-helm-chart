@@ -1,47 +1,68 @@
 # svc-helm-chart
 
-AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). Meant for the
-`k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network Edge
-BYOI), but it works on any k3s with Traefik and the local-path StorageClass.
+AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the
+plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network
+Edge BYOI) and works on any k3s with Traefik and the local-path StorageClass. There are no custom container images
+and no registry to maintain.
 
 ## Summary
 
-- **Install:** copy `ai-gateway.yaml` into `/var/lib/rancher/k3s/server/manifests/` after creating the two Secrets below. k3s's Helm controller does the rest.
-- **Components:** LiteLLM, Langfuse, Presidio, LLM Guard, Qdrant, a RAG service, Postgres, Redis, ClickHouse and SeaweedFS (S3).
+- **What:** LiteLLM gateway with Langfuse observability, Presidio and LLM Guard guardrails, and RAG on Qdrant and S3.
+- **How:** Day 0 creates two Secrets and downloads `ai-gateway.yaml` into k3s's manifests directory; k3s's built-in Helm controller installs the charts and applies the rest.
 - **Exposed:** only LiteLLM, on 80/443 through Traefik. Everything else stays inside the cluster.
-- **Status:** the file builds, all three charts render with `helm template`, the k3s API accepts every resource (server-side dry run), and the LiteLLM guardrail modules import under LiteLLM 1.108.0. **It has not been deployed**: first-boot behaviour (migrations, model downloads) is untested.
+- **Needs:** outbound internet at first boot (GitHub, container registries, PyPI, Hugging Face).
+- **Status:** validated statically (below). **Not yet deployed on a device**, so first-boot behaviour is untested.
 
 ## Components
 
-| Area | Component | Source |
+| Area | Component | How it is deployed |
 |---|---|---|
-| Gateway | LiteLLM 1.108.0 | OCI chart `ghcr.io/berriai/litellm-helm` (release `ai`, Service `ai-litellm:4000`) |
-| Observability | Langfuse 4.75 | chart `langfuse` 2.2.3; its bundled SeaweedFS is the S3 store |
+| Gateway | LiteLLM 1.108.0 | public OCI chart `ghcr.io/berriai/litellm-helm` (release `ai`, Service `ai-litellm:4000`) |
+| Observability | Langfuse 4.75 (web, worker) | public chart `langfuse` 2.2.3 |
 | Guardrails | Presidio analyzer + anonymizer | `mcr.microsoft.com/presidio-*`, plain Deployments |
-| | LLM Guard (DeBERTa v3 prompt injection, secrets) | `python:3.12-slim`, code in a ConfigMap, CPU PyTorch installed on first start |
-| RAG | Qdrant 1.20 | chart `qdrant` 1.20.0 |
-| | rag-service (fastembed `bge-small-en-v1.5`, ingest from S3) | `python:3.12-slim`, code in a ConfigMap |
-| Data | Postgres 16 (`litellm`, `langfuse`), Redis 7, ClickHouse 26.8 | official images, plain Deployments |
-| S3 | SeaweedFS all-in-one (buckets `langfuse`, `rag-docs`) | from the Langfuse chart; replaces MinIO, whose images are no longer published |
+| | LLM Guard: DeBERTa v3 prompt injection, secrets | `python:3.12-slim`, code in a ConfigMap, `llm-guard` on CPU-only PyTorch installed on first start |
+| RAG | Qdrant 1.20 | public chart `qdrant` 1.20.0 |
+| | rag-service: fastembed `bge-small-en-v1.5`, ingest from S3 | `python:3.12-slim`, code in a ConfigMap |
+| Data | Postgres 16 (databases `litellm`, `langfuse`), Redis 7, ClickHouse 26.8 | official images, plain Deployments |
+| S3 | SeaweedFS all-in-one (buckets `langfuse`, `rag-docs`) | shipped by the Langfuse chart; replaces MinIO, whose images are no longer published |
 
 Langfuse's own Postgres, Redis and ClickHouse sub-charts are turned off: its ClickHouse needs an operator and a
-three-node Keeper, too heavy for one node.
+three-node Keeper, too heavy for one node. Langfuse uses the shared Postgres, Redis and ClickHouse above.
 
-## Secrets (created before the file is applied)
+## How it works
 
-Namespace `ai-gateway`. Nothing secret is in `ai-gateway.yaml`.
+```
+client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
+            pre-call : rag-augment (opt-in) -> rag-service -> Qdrant + SeaweedFS
+                       llm-guard -> llm-guard service (prompt injection blocks, secrets redacted)
+                       presidio-pre-call -> Presidio (PII masked)
+            model    : llm-pool = Groq + Gemini, usage-based routing
+            post-call: llm-guard (secrets), presidio-post-call (PII)
+            traces   : Langfuse (web -> Postgres, ClickHouse, Redis, SeaweedFS)
+```
+
+- **Guardrails:** LiteLLM loads two custom modules from a ConfigMap (`llm_guard_guardrail.py`, `rag_augment.py`) and uses its native Presidio integration. Presidio, LLM Guard and RAG failures never take the gateway down: injection blocking applies only when LLM Guard answers, and the others pass requests through unchanged.
+- **Injection gate:** DeBERTa must flag the text and explicit injection wording must be present before a request is blocked, to avoid DeBERTa's false positives on ordinary instructions.
+- **RAG:** opt-in per request with `"guardrails": ["rag-augment"]`. Documents (`.txt`, `.md`) go in bucket `rag-docs` and are ingested into Qdrant collection `knowledge-base`.
+- **Secrets:** none are in `ai-gateway.yaml`. Day 0 creates them in namespace `ai-gateway` before the file is applied; the S3 password is generated by the Langfuse chart.
+- **Config source:** `ai-gateway.yaml` is generated from `ai-gateway.yaml.in` and `src/` by `scripts/build.py`.
+
+## Secrets
 
 | Secret | Keys |
 |---|---|
 | `ai-secrets` | `POSTGRES_USER` `POSTGRES_PASSWORD` `REDIS_PASSWORD` `CLICKHOUSE_PASSWORD` `LANGFUSE_SALT` `LANGFUSE_ENCRYPTION_KEY` (64 hex) `LANGFUSE_NEXTAUTH_SECRET` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` `LANGFUSE_INIT_USER_EMAIL` `LANGFUSE_INIT_USER_PASSWORD` |
-| `litellm-env` | `LITELLM_MASTER_KEY` `REDIS_PASSWORD` `GROQ_API_KEY` `GEMINI_API_KEY` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` (same values as `ai-secrets`) |
+| `litellm-env` | `LITELLM_MASTER_KEY` `REDIS_PASSWORD` `GROQ_API_KEY` `GEMINI_API_KEY` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` (same values as in `ai-secrets`) |
 
-The S3 password is generated by the Langfuse chart (Secret `langfuse-s3-auth`). The Day 0 file in svc-ne-byoi-builder
-(`day0/day0-ai-gateway.yaml`) generates all of this and downloads the file.
+The Day 0 file in svc-ne-byoi-builder (`day0/day0-ai-gateway.yaml`) generates these and downloads the file. Its
+optional parameters are `GROQ_API_KEY`, `GEMINI_API_KEY`, `LITELLM_MASTER_KEY`, `LANGFUSE_ADMIN_EMAIL`,
+`LANGFUSE_ADMIN_PASSWORD`, `STACK_REF` (branch or tag to fetch, default `main`) and `STACK_TOKEN` (read-only GitHub
+token, needed while the repo is private). Generated credentials are written to `/etc/ai-gateway/credentials.env`
+(root only).
 
 ## First start
 
-- **LLM Guard** installs CPU PyTorch and `llm-guard` into its volume and downloads the DeBERTa weights: about 10 minutes and a few GB, needs PyPI and Hugging Face. Its startup probe allows 30 minutes. Later restarts reuse the volume.
+- **LLM Guard** installs CPU PyTorch and `llm-guard` into its volume and downloads the DeBERTa weights: about 10 minutes and a few GB. Its startup probe allows 30 minutes. Later restarts reuse the volume.
 - **rag-service** installs its packages and downloads the embedding model the same way (smaller).
 - **LiteLLM, Langfuse and the databases** wait for each other through probes and retries; expect several restarts in the first minutes.
 
@@ -52,18 +73,26 @@ sudo cat /etc/ai-gateway/credentials.env            # master key, Langfuse login
 curl -k https://<ip>/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model":"llm-pool","messages":[{"role":"user","content":"hi"}]}'
 # Langfuse UI: ssh -L 3000:localhost:3000 <ip>, then on the node: sudo k3s kubectl -n ai-gateway port-forward svc/langfuse-web 3000
-# RAG: per request add "guardrails": ["rag-augment"]. Put .txt/.md files into bucket rag-docs, then ingest:
+# RAG: add .txt/.md files to bucket rag-docs, then ingest
 sudo k3s kubectl -n ai-gateway exec deploy/rag-service -- python -c \
   "import httpx;print(httpx.post('http://localhost:8000/ingest',json={},timeout=600).json())"
 ```
 
-## Build and validate
+## What was validated
 
-`ai-gateway.yaml` is generated: edit `ai-gateway.yaml.in` and the files under `src/`, then run `scripts/build.py`
-(or `scripts/validate.sh`, which also renders every chart with `helm template` in Docker). Commit both.
+- The Qdrant (1.20.0), Langfuse (2.2.3) and LiteLLM (1.108.0) charts render with `helm template` using the values in this file, and every image they use exists (`scripts/validate.sh`).
+- A throwaway k3s accepted all 28 resources, including the three `HelmChart`s, in a server-side dry run.
+- The LiteLLM guardrail modules import under the real LiteLLM 1.108.0 image, and their hook signatures match.
+- Day 0 (about 12 KB) renders and passes a shell syntax check.
 
 ## Known limits
 
-- Floating tags: `presidio-*:latest`, `python:3.12-slim`, and the packages installed at first start (`llm-guard`, `torch`) can change between boots. Pin once a deployment is validated.
-- The LLM Guard injection gate and its secrets scanner are carried over from an earlier lab setup; the model names `groq/qwen/qwen3.8-27b` and `gemini/gemini-3.5-flash-lite` in `src/litellm/config.yaml` come from there and may need updating.
-- No TLS certificate beyond Traefik's default, no backups of the volumes, no authentication in front of `/ui` other than LiteLLM's own.
+- Floating tags: `presidio-*:latest`, `python:3.12-slim`, and the packages installed at first start (`llm-guard`, `torch`) can change between boots. Pin them once a deployment is validated.
+- The Groq and Gemini model names in `src/litellm/config.yaml` come from an earlier lab config and may be stale.
+- The Equinix portal's Day 0 size limit is unknown.
+- No TLS certificate beyond Traefik's default, no volume backups, and no authentication in front of LiteLLM's `/ui` other than its own login.
+
+## Build and validate
+
+Edit `ai-gateway.yaml.in` and the files under `src/`, then run `scripts/build.py` (or `scripts/validate.sh`, which
+also renders every chart with `helm template` in Docker). Commit both the sources and the generated file.
