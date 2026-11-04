@@ -54,11 +54,21 @@ client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
 | `ai-secrets` | `POSTGRES_USER` `POSTGRES_PASSWORD` `REDIS_PASSWORD` `CLICKHOUSE_PASSWORD` `LANGFUSE_SALT` `LANGFUSE_ENCRYPTION_KEY` (64 hex) `LANGFUSE_NEXTAUTH_SECRET` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` `LANGFUSE_INIT_USER_EMAIL` `LANGFUSE_INIT_USER_PASSWORD` |
 | `litellm-env` | `LITELLM_MASTER_KEY` `REDIS_PASSWORD` `GROQ_API_KEY` `GEMINI_API_KEY` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` (same values as in `ai-secrets`) |
 
-The Day 0 file in svc-ne-byoi-builder (`day0/day0-ai-gateway.yaml`) generates these and downloads the file. Its
-optional parameters are `GROQ_API_KEY`, `GEMINI_API_KEY`, `LITELLM_MASTER_KEY`, `LANGFUSE_ADMIN_EMAIL`,
-`LANGFUSE_ADMIN_PASSWORD`, `STACK_REF` (branch or tag to fetch, default `main`) and `STACK_TOKEN` (read-only GitHub
-token, only for a private fork; the repo is public). Generated credentials are written to `/etc/ai-gateway/credentials.env`
-(root only).
+## Day 0
+
+[`day0/day0-ai-gateway.yaml`](day0/day0-ai-gateway.yaml) is the Equinix Network Edge Day 0 template for the unchanged
+`k3s-node.qcow2` (built by [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder), whose
+`docs/portal-values.md` lists the portal settings). It does what that image's own Day 0 does (hostname, static
+network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
+
+1. generates the two Secrets above (random values, except the keys you pass in) and writes the ones you need to `/etc/ai-gateway/credentials.env` (root only);
+2. downloads `ai-gateway.yaml` from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s's Helm controller deploys it.
+
+Optional custom parameters (in addition to the `K3S_*` ones): `GROQ_API_KEY`, `GEMINI_API_KEY`,
+`LITELLM_MASTER_KEY` (generated when empty), `LANGFUSE_ADMIN_EMAIL`, `LANGFUSE_ADMIN_PASSWORD` (generated when
+empty), `STACK_REF` (branch or tag of this repo to fetch, default `main`; pin a tag for repeatable boots) and
+`STACK_TOKEN` (read-only GitHub token, only for a private fork). Log: `/var/log/day0.log`. Render it locally with
+`scripts/render-day0.sh`. ACL: allow 22 and 80/443; Langfuse, Qdrant and S3 are not exposed.
 
 ## First start
 

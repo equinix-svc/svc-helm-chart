@@ -1,0 +1,256 @@
+#cloud-config
+# Day 0 template for the Equinix Network Edge custom VNF profile "k3s-node" (image from equinix-svc/svc-ne-byoi-builder),
+# extended to install the AI gateway stack of this repo.
+#
+# Placeholders use the Equinix inline syntax (case-sensitive names), see docs/portal-values.md in svc-ne-byoi-builder.
+#   Equinix predefined: hostname userName publicKey adminPwd ipAddressWithCidr gateway
+#   Custom parameters : K3S_ROLE K3S_SERVER_URL K3S_TOKEN K3S_TLS_SAN
+#                       GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
+#                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN   (all optional)
+# AI gateway variant. Uses the plain k3s-node image: on a single node or the first server, once k3s is Ready,
+# it generates the stack secrets, downloads ai-gateway.yaml from github.com/equinix-svc/svc-helm-chart
+# (branch or tag STACK_REF, default main; STACK_TOKEN is only for a private fork) into the
+# k3s manifests directory, and k3s's Helm controller deploys LiteLLM, Langfuse, Presidio, LLM Guard, Qdrant and
+# the RAG service. Needs outbound internet at first boot. Credentials: /etc/ai-gateway/credentials.env (root).
+#
+# Equinix injects a STATIC address (no DHCP), so this file configures the network itself.
+#
+# Roles (K3S_ROLE): single | server | agent
+#   single : standalone node (server with embedded datastore)
+#   server : control-plane node; joins K3S_SERVER_URL if provided, otherwise initialises a new cluster
+#   agent  : worker; requires K3S_SERVER_URL and K3S_TOKEN
+
+hostname: [(${hostname})]
+manage_etc_hosts: true
+preserve_hostname: false
+
+# The user is created by the bootstrap script below; an empty list stops cloud-init adding its default user.
+users: []
+
+ssh_pwauth: false
+
+ntp:
+  enabled: true
+  ntp_client: chrony
+  servers:
+    - 0.pool.ntp.org
+    - 1.pool.ntp.org
+
+write_files:
+  # Static network (systemd-networkd). Sorts before cloud-init's generated DHCP file, so it wins.
+  # Interface name ens3 is what Equinix uses in its own Debian/Ubuntu example.
+  - path: /etc/systemd/network/05-equinix.network
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=ens3
+
+      [Network]
+      Address=[(${ipAddressWithCidr})]
+      Gateway=[(${gateway})]
+      DNS=8.8.8.8
+      DNS=8.8.4.4
+
+  - path: /etc/day0/params.env
+    owner: root:root
+    permissions: "0600"
+    content: |
+      USER_NAME='[(${userName})]'
+      PUBLIC_KEY='[(${publicKey})]'
+      ADMIN_PWD='[(${adminPwd})]'
+      ADMIN_PASSWORD='[(${adminPassword})]'
+      K3S_ROLE='[(${K3S_ROLE})]'
+      K3S_SERVER_URL='[(${K3S_SERVER_URL})]'
+      K3S_TOKEN='[(${K3S_TOKEN})]'
+      K3S_TLS_SAN='[(${K3S_TLS_SAN})]'
+      GROQ_API_KEY='[(${GROQ_API_KEY})]'
+      GEMINI_API_KEY='[(${GEMINI_API_KEY})]'
+      LITELLM_MASTER_KEY='[(${LITELLM_MASTER_KEY})]'
+      LANGFUSE_ADMIN_EMAIL='[(${LANGFUSE_ADMIN_EMAIL})]'
+      LANGFUSE_ADMIN_PASSWORD='[(${LANGFUSE_ADMIN_PASSWORD})]'
+      STACK_REF='[(${STACK_REF})]'
+      STACK_TOKEN='[(${STACK_TOKEN})]'
+
+  - path: /usr/local/bin/day0-ai-stack.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Called by day0-bootstrap.sh with GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
+      # LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN in the environment (all optional).
+      set -euo pipefail
+      K="/usr/local/bin/k3s kubectl"
+      MAN=/var/lib/rancher/k3s/server/manifests
+      REF="${STACK_REF:-main}"
+      gen() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
+
+      MASTER="${LITELLM_MASTER_KEY:-sk-$(gen 20)}"
+      LF_EMAIL="${LANGFUSE_ADMIN_EMAIL:-admin@ai-gateway.local}"
+      LF_PASS="${LANGFUSE_ADMIN_PASSWORD:-$(gen 12)}"
+      PG="$(gen 16)"; RD="$(gen 16)"; CH="$(gen 16)"
+      LF_PK="pk-lf-$(gen 16)"; LF_SK="sk-lf-$(gen 16)"
+
+      install -d -m 0700 /etc/ai-gateway
+      ( umask 077; cat > /etc/ai-gateway/credentials.env <<EOF
+      LITELLM_MASTER_KEY=$MASTER
+      LANGFUSE_ADMIN_EMAIL=$LF_EMAIL
+      LANGFUSE_ADMIN_PASSWORD=$LF_PASS
+      LANGFUSE_PUBLIC_KEY=$LF_PK
+      LANGFUSE_SECRET_KEY=$LF_SK
+      EOF
+      )
+
+      $K create namespace ai-gateway --dry-run=client -o yaml | $K apply -f -
+      $K -n ai-gateway create secret generic ai-secrets \
+        --from-literal=POSTGRES_USER=ai --from-literal=POSTGRES_PASSWORD="$PG" \
+        --from-literal=REDIS_PASSWORD="$RD" --from-literal=CLICKHOUSE_PASSWORD="$CH" \
+        --from-literal=LANGFUSE_SALT="$(gen 16)" --from-literal=LANGFUSE_ENCRYPTION_KEY="$(gen 32)" \
+        --from-literal=LANGFUSE_NEXTAUTH_SECRET="$(gen 16)" \
+        --from-literal=LANGFUSE_PUBLIC_KEY="$LF_PK" --from-literal=LANGFUSE_SECRET_KEY="$LF_SK" \
+        --from-literal=LANGFUSE_INIT_USER_EMAIL="$LF_EMAIL" --from-literal=LANGFUSE_INIT_USER_PASSWORD="$LF_PASS"
+      $K -n ai-gateway create secret generic litellm-env \
+        --from-literal=LITELLM_MASTER_KEY="$MASTER" --from-literal=REDIS_PASSWORD="$RD" \
+        --from-literal=GROQ_API_KEY="${GROQ_API_KEY:-}" --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
+        --from-literal=LANGFUSE_PUBLIC_KEY="$LF_PK" --from-literal=LANGFUSE_SECRET_KEY="$LF_SK"
+
+      AUTH=()
+      [ -n "${STACK_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $STACK_TOKEN")
+      for i in 1 2 3 4 5 6; do
+        curl -fsSL --retry 3 "${AUTH[@]}" -H "Accept: application/vnd.github.raw" \
+          "https://api.github.com/repos/equinix-svc/svc-helm-chart/contents/ai-gateway.yaml?ref=$REF" \
+          -o "$MAN/ai-gateway.yaml" && break
+        echo "download failed (try $i), retrying"; sleep 20
+      done
+      [ -s "$MAN/ai-gateway.yaml" ] || { echo "could not download ai-gateway.yaml"; exit 1; }
+      echo "ai-gateway.yaml installed in $MAN (ref $REF); k3s will deploy it"
+
+  - path: /usr/local/bin/day0-bootstrap.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # First-boot k3s bootstrap. Idempotent: does nothing once /var/log/day0-done exists.
+      set -euo pipefail
+      exec >>/var/log/day0.log 2>&1
+      echo "[$(date -Is)] day0-bootstrap start"
+
+      [ -e /var/log/day0-done ] && { echo "already done"; exit 0; }
+      . /etc/day0/params.env
+
+      echo "network at start:"; ip -br a; ip r
+
+      # User: the portal user (userName). The key comes from publicKey (may lack the key
+      # type); the portal password hash is set on the user.
+      norm_key() {
+        case "$1" in
+          ssh-*|ecdsa-*|sk-*)    echo "$1" ;;
+          AAAAB3NzaC1yc2*)       echo "ssh-rsa $1" ;;
+          AAAAC3NzaC1lZDI1NTE5*) echo "ssh-ed25519 $1" ;;
+          *)                     echo "$1" ;;
+        esac
+      }
+      # adminPwd should be the MD5 crypt hash; adminPassword appeared alongside it on a real device, so pick
+      # whichever looks like a hash, else fall back to a plain-text value. Never concatenate them.
+      is_hash() { case "$1" in '$1$'*|'$5$'*|'$6$'*|'$y$'*|'$2'*) return 0 ;; *) return 1 ;; esac; }
+      PWD_HASH=""; PWD_PLAIN=""
+      if is_hash "$ADMIN_PWD"; then PWD_HASH="$ADMIN_PWD"
+      elif is_hash "$ADMIN_PASSWORD"; then PWD_HASH="$ADMIN_PASSWORD"
+      elif [ -n "$ADMIN_PASSWORD" ]; then PWD_PLAIN="$ADMIN_PASSWORD"
+      elif [ -n "$ADMIN_PWD" ]; then PWD_PLAIN="$ADMIN_PWD"
+      fi
+      setup_user() {
+        local u="$1" h g k
+        if ! id "$u" >/dev/null 2>&1; then
+          useradd -m -s /bin/bash "$u"
+          echo "$u ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$u"; chmod 0440 "/etc/sudoers.d/90-$u"
+        fi
+        h="$(getent passwd "$u" | cut -d: -f6)"; g="$(id -gn "$u")"
+        if [ -n "$PWD_HASH" ]; then usermod -p "$PWD_HASH" "$u"
+        elif [ -n "$PWD_PLAIN" ]; then echo "$u:$PWD_PLAIN" | chpasswd
+        fi
+        install -d -o "$u" -g "$g" -m 0700 "$h/.ssh"
+        if [ -n "$PUBLIC_KEY" ]; then norm_key "$PUBLIC_KEY" >> "$h/.ssh/authorized_keys"; fi
+        if [ -f "$h/.ssh/authorized_keys" ]; then
+          sort -u "$h/.ssh/authorized_keys" -o "$h/.ssh/authorized_keys"
+          chown "$u:$g" "$h/.ssh/authorized_keys"; chmod 0600 "$h/.ssh/authorized_keys"
+        fi
+      }
+      if [ -n "$USER_NAME" ]; then
+        setup_user "$USER_NAME" || echo "could not set up user $USER_NAME"
+      else
+        echo "userName is empty: no account created"
+      fi
+
+      # Non-secret diagnostic (lengths and first characters only), shown at the console login prompt.
+      PWD_MODE=none; if [ -n "$PWD_HASH" ]; then PWD_MODE=hash; elif [ -n "$PWD_PLAIN" ]; then PWD_MODE=plain; fi
+      A_HEAD=n/a; if is_hash "$ADMIN_PWD"; then A_HEAD="${ADMIN_PWD:0:3}"; fi
+      B_HASH=no; if is_hash "$ADMIN_PASSWORD"; then B_HASH=yes; fi
+      DIAG="DAY0-DIAG user=[$USER_NAME] pubkey_len=${#PUBLIC_KEY} pubkey_head=${PUBLIC_KEY:0:14} adminPwd_len=${#ADMIN_PWD} head=$A_HEAD adminPassword_len=${#ADMIN_PASSWORD} is_hash=$B_HASH pwd_mode=$PWD_MODE"
+      echo "$DIAG"
+      echo "$DIAG" >> /etc/issue
+      echo "$DIAG" > /dev/console || true
+
+      ROLE="$K3S_ROLE"; [ -n "$ROLE" ] || ROLE=single
+      NODE_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
+
+      mkdir -p /etc/rancher/k3s
+      CFG=/etc/rancher/k3s/config.yaml
+      : > "$CFG"; chmod 0600 "$CFG"
+      [ -n "$NODE_IP" ] && echo "node-ip: $NODE_IP" >> "$CFG"
+      [ -n "$K3S_TOKEN" ] && echo "token: \"$K3S_TOKEN\"" >> "$CFG"
+
+      case "$ROLE" in
+        single)
+          echo "write-kubeconfig-mode: \"0640\"" >> "$CFG"
+          [ -n "$K3S_TLS_SAN" ] && printf 'tls-san:\n  - "%s"\n' "$K3S_TLS_SAN" >> "$CFG"
+          UNIT=k3s ;;
+        server)
+          echo "write-kubeconfig-mode: \"0640\"" >> "$CFG"
+          [ -n "$K3S_TLS_SAN" ] && printf 'tls-san:\n  - "%s"\n' "$K3S_TLS_SAN" >> "$CFG"
+          if [ -n "$K3S_SERVER_URL" ]; then echo "server: \"$K3S_SERVER_URL\"" >> "$CFG"; else echo "cluster-init: true" >> "$CFG"; fi
+          UNIT=k3s ;;
+        agent)
+          [ -n "$K3S_SERVER_URL" ] && [ -n "$K3S_TOKEN" ] || { echo "agent needs K3S_SERVER_URL and K3S_TOKEN"; exit 1; }
+          echo "server: \"$K3S_SERVER_URL\"" >> "$CFG"
+          UNIT=k3s-agent ;;
+        *) echo "unknown K3S_ROLE: $ROLE"; exit 1 ;;
+      esac
+
+      systemctl daemon-reload
+      systemctl enable --now "$UNIT"
+
+      if [ "$UNIT" = k3s ]; then
+        for i in $(seq 1 60); do
+          /usr/local/bin/k3s kubectl get nodes 2>/dev/null | grep -qw Ready && break
+          sleep 5
+        done
+        /usr/local/bin/k3s kubectl get nodes -o wide || true
+        # make kubectl usable for the portal user
+        for u in "$USER_NAME"; do
+          if [ -n "$u" ] && id "$u" >/dev/null 2>&1; then
+            uh="$(getent passwd "$u" | cut -d: -f6)"; ug="$(id -gn "$u")"
+            install -d -o "$u" -g "$ug" -m 0700 "$uh/.kube"
+            install -o "$u" -g "$ug" -m 0600 /etc/rancher/k3s/k3s.yaml "$uh/.kube/config"
+          fi
+        done
+      fi
+
+      # AI gateway stack: single node or first server only (agents and joining servers do not deploy it)
+      if [ "$UNIT" = k3s ] && [ -z "$K3S_SERVER_URL" ]; then
+        echo "installing the AI gateway stack"
+        GROQ_API_KEY="$GROQ_API_KEY" GEMINI_API_KEY="$GEMINI_API_KEY" LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY" \
+        LANGFUSE_ADMIN_EMAIL="$LANGFUSE_ADMIN_EMAIL" LANGFUSE_ADMIN_PASSWORD="$LANGFUSE_ADMIN_PASSWORD" \
+        STACK_REF="$STACK_REF" STACK_TOKEN="$STACK_TOKEN" /usr/local/bin/day0-ai-stack.sh \
+          || echo "AI gateway install failed: see this log"
+      fi
+
+      # secrets must not linger in the clear after the unit has consumed them
+      shred -u /etc/day0/params.env 2>/dev/null || rm -f /etc/day0/params.env
+      date -Is > /var/log/day0-done
+      echo "[$(date -Is)] day0-bootstrap done (role=$ROLE)"
+
+runcmd:
+  # apply the static network, then bootstrap
+  - [ sh, -c, "networkctl reload; networkctl reconfigure ens3 || systemctl restart systemd-networkd" ]
+  - [ /usr/local/bin/day0-bootstrap.sh ]
