@@ -6,7 +6,7 @@
 #   Equinix predefined: hostname userName publicKey adminPwd ipAddressWithCidr gateway
 #   Custom parameters : K3S_ROLE K3S_SERVER_URL K3S_TOKEN K3S_TLS_SAN
 #                       GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
-#                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN   (all optional)
+#                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN REGISTRY_USER REGISTRY_TOKEN   (all optional)
 # AI gateway variant. Uses the plain k3s-node image: on a single node or the first server, once k3s is Ready,
 # it generates the stack secrets, downloads ai-gateway.yaml from github.com/equinix-svc/svc-helm-daihub
 # (branch or tag STACK_REF, default main; STACK_TOKEN is only for a private fork) into the
@@ -71,6 +71,8 @@ write_files:
       LANGFUSE_ADMIN_PASSWORD='[(${LANGFUSE_ADMIN_PASSWORD})]'
       STACK_REF='[(${STACK_REF})]'
       STACK_TOKEN='[(${STACK_TOKEN})]'
+      REGISTRY_USER='[(${REGISTRY_USER})]'
+      REGISTRY_TOKEN='[(${REGISTRY_TOKEN})]'
 
   - path: /usr/local/bin/day0-ai-stack.sh
     owner: root:root
@@ -216,6 +218,20 @@ write_files:
           UNIT=k3s-agent ;;
         *) echo "unknown K3S_ROLE: $ROLE"; exit 1 ;;
       esac
+
+      # Private container images on ghcr.io (e.g. the chat page): pull credentials for containerd (k3s reads this file at start)
+      if [ -n "$REGISTRY_TOKEN" ]; then
+        install -d -m 0755 /etc/rancher/k3s
+        ( umask 077; cat > /etc/rancher/k3s/registries.yaml <<EOF
+      configs:
+        "ghcr.io":
+          auth:
+            username: "$REGISTRY_USER"
+            password: "$REGISTRY_TOKEN"
+      EOF
+        )
+        echo "registry credentials for ghcr.io written"
+      fi
 
       systemctl daemon-reload
       systemctl enable --now "$UNIT"
