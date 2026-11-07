@@ -2,6 +2,17 @@
 
 AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network Edge BYOI) and works on any k3s with Traefik and the local-path StorageClass. There are no custom container images and no registry to maintain. It has been validated statically (below) but **not yet deployed on a device**, so first-boot behaviour is untested.
 
+## Quick start
+
+| Step | What |
+|---|---|
+| 1. VM image | Plain `k3s-node` image (`k3s-node.qcow2`) from [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder). Portal settings: `docs/portal-values.md` in that repo. |
+| 2. Container images | None to build: all images are public. |
+| 3. Day 0 file | [`day0/day0-ai-gateway.yaml`](day0/day0-ai-gateway.yaml). |
+| 4. Parameters | None is strictly required. Set `GROQ_API_KEY` and `GEMINI_API_KEY` for the models to answer. Full list: [Day 0 parameters](#day-0-parameters). |
+
+ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
+
 ## Stack
 
 | Area | Component | How it is deployed |
