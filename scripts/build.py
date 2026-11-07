@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build.py - assemble ai-gateway.yaml from ai-gateway.yaml.in.
+"""build.py - assemble ai-gateway.yaml (and the chat-ui example) from their .in templates.
 
 A line holding only "@@FILE path@@" is replaced by that file's lines, indented like the marker. Includes may nest.
 Usage: scripts/build.py            (writes ai-gateway.yaml)
@@ -28,5 +28,6 @@ def expand(text: str, seen: tuple = ()) -> str:
 
 
 if __name__ == "__main__":
-    (ROOT / "ai-gateway.yaml").write_text(expand((ROOT / "ai-gateway.yaml.in").read_text()))
-    print("wrote ai-gateway.yaml")
+    for src, dst in (("ai-gateway.yaml.in", "ai-gateway.yaml"), ("examples/chat-ui/chat-ui.yaml.in", "examples/chat-ui/chat-ui.yaml")):
+        (ROOT / dst).write_text(expand((ROOT / src).read_text()))
+        print("wrote", dst)

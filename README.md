@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="DAI Hub" width="120">
 
-AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network Edge BYOI) and works on any k3s with Traefik and the local-path StorageClass. There are no custom container images and no registry to maintain. It has been validated statically (section 7) but **not yet deployed on a device**, so first-boot behaviour is untested.
+AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network Edge BYOI) and works on any k3s with Traefik and the local-path StorageClass. There are no custom container images and no registry to maintain. It has been validated statically (section 9) but **not yet deployed on a device**, so first-boot behaviour is untested.
 
 ## 1. Stack
 
@@ -34,7 +34,7 @@ ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
 
 Both templates are the Equinix Network Edge Day 0 for the unchanged `k3s-node.qcow2` (portal settings in `docs/portal-values.md` of svc-ne-byoi-builder). They do what that image's own Day 0 does (hostname, static network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
 
-1. generate the two Secrets (see 4. How it works) with random values, except the keys you pass in, and write the ones you need to `/etc/ai-gateway/credentials.env` (root only);
+1. generate the two Secrets (see 6. How it works) with random values, except the keys you pass in, and write the ones you need to `/etc/ai-gateway/credentials.env` (root only);
 2. download `ai-gateway.yaml` from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s's Helm controller deploys it.
 
 | Template | Use | Portal parameters |
@@ -64,7 +64,44 @@ The **BASIC** and **ADVANCED** columns show whether the parameter is required in
 
 ACL: allow 22 and 80/443. Langfuse, Qdrant and S3 are not exposed.
 
-## 4. How it works
+## 4. Web interfaces
+
+`<node>` is the node's IP. Only LiteLLM (and the optional chat page) is exposed. The others are cluster-internal: reach them through an SSH tunnel.
+
+| Interface | URL | Access | Login |
+|---|---|---|---|
+| Chat page (example, section 5) | `https://<node>/chat/` | public, once applied | a LiteLLM key, pasted in the page |
+| LiteLLM admin UI | `https://<node>/ui/` | public | user `admin`, password = `LITELLM_MASTER_KEY` (default login) |
+| LiteLLM API docs (Swagger) | `https://<node>/` | public | API calls: `Authorization: Bearer <key>` on `/v1/...` |
+| Langfuse (traces) | `http://localhost:3000` | SSH tunnel | `LANGFUSE_ADMIN_EMAIL` / `LANGFUSE_ADMIN_PASSWORD` |
+| Qdrant dashboard (vectors) | `http://localhost:6333/dashboard` | SSH tunnel | none |
+| SeaweedFS filer (S3 buckets, RAG documents) | `http://localhost:8888` | SSH tunnel | none |
+| rag-service API docs | `http://localhost:8000/docs` | SSH tunnel | none |
+
+The master key and the Langfuse login are in `/etc/ai-gateway/credentials.env` on the node (`sudo cat`). The certificate is Traefik's default, so a browser warns; accept it.
+
+Tunnel (one terminal per interface; replace the service and ports):
+
+```bash
+ssh -L 3000:localhost:3000 <user>@<node> "sudo k3s kubectl -n ai-gateway port-forward svc/langfuse-web 3000"
+# Qdrant: svc/qdrant 6333    SeaweedFS filer: svc/langfuse-s3-all-in-one 8888    rag-service: svc/rag-service 8000
+```
+
+## 5. Chat page (example)
+
+[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file (no build, no external script) served by nginx, behind the same Traefik. It is optional and not part of `ai-gateway.yaml`.
+
+| Item | Detail |
+|---|---|
+| Install | `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
+| Open | `https://<node>/chat/`, paste a LiteLLM key (the master key, or a virtual key from the admin UI) |
+| Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection |
+| Remove | `sudo k3s kubectl delete -f` the same URL |
+| Sources | `index.html`, `default.conf`, `chat-ui.yaml.in`; `scripts/build.py` generates `chat-ui.yaml` |
+
+The key stays in the browser tab (`sessionStorage`) and goes only to the same host. Tested on the node: the PII sample came back with `<PERSON>`, `<EMAIL_ADDRESS>` and `<PHONE_NUMBER>`, the secret sample was masked, and the injection sample was blocked by LLM Guard (HTTP 400).
+
+## 6. How it works
 
 ```
 client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
@@ -89,7 +126,7 @@ client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
 | `ai-secrets` | `POSTGRES_USER` `POSTGRES_PASSWORD` `REDIS_PASSWORD` `CLICKHOUSE_PASSWORD` `LANGFUSE_SALT` `LANGFUSE_ENCRYPTION_KEY` (64 hex) `LANGFUSE_NEXTAUTH_SECRET` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` `LANGFUSE_INIT_USER_EMAIL` `LANGFUSE_INIT_USER_PASSWORD` |
 | `litellm-env` | `LITELLM_MASTER_KEY` `REDIS_PASSWORD` `GROQ_API_KEY` `GEMINI_API_KEY` `LANGFUSE_PUBLIC_KEY` `LANGFUSE_SECRET_KEY` (same values as in `ai-secrets`) |
 
-## 5. First start
+## 7. First start
 
 | Component | What happens |
 |---|---|
@@ -97,7 +134,7 @@ client -> Traefik :80/:443 -> LiteLLM (ai-litellm:4000)
 | rag-service | Installs its packages and downloads the embedding model the same way (smaller). |
 | LiteLLM, Langfuse, databases | Wait for each other through probes and retries. Expect several restarts in the first minutes. |
 
-## 6. Use
+## 8. Use
 
 ```bash
 sudo cat /etc/ai-gateway/credentials.env            # master key, Langfuse login (when installed by Day 0)
@@ -109,14 +146,14 @@ sudo k3s kubectl -n ai-gateway exec deploy/rag-service -- python -c \
   "import httpx;print(httpx.post('http://localhost:8000/ingest',json={},timeout=600).json())"
 ```
 
-## 7. What was tested
+## 9. What was tested
 
 - The Qdrant (1.20.0), Langfuse (2.2.3) and LiteLLM (1.108.0) charts render with `helm template` using the values in this file, and every image they use exists (`scripts/validate.sh`).
 - A throwaway k3s accepted all 28 resources, including the three `HelmChart`s, in a server-side dry run.
 - The LiteLLM guardrail modules import under the real LiteLLM 1.108.0 image, and their hook signatures match.
 - Both Day 0 templates (about 12 KB each) render and pass a shell syntax check.
 
-## 8. Findings and limits
+## 10. Findings and limits
 
 - **Fail open:** the LLM Guard and RAG modules let a request through unchanged (logged) if their service is unreachable, so injection blocking applies only while LLM Guard answers. How LiteLLM's native Presidio hooks behave when Presidio is down is untested.
 - **Floating tags:** `presidio-*:latest`, `python:3.12-slim`, and the packages installed at first start (`llm-guard`, `torch`) can change between boots. Pin them once a deployment is validated.
@@ -125,6 +162,6 @@ sudo k3s kubectl -n ai-gateway exec deploy/rag-service -- python -c \
 - **Not provided:** TLS certificate beyond Traefik's default, volume backups, and authentication in front of LiteLLM's `/ui` other than its own login.
 - **Internet:** the node needs outbound internet at first boot (GitHub, container registries, PyPI, Hugging Face).
 
-## 9. Build and validate
+## 11. Build and validate
 
 Edit `ai-gateway.yaml.in` and the files under `src/`, then run `scripts/validate.sh`. It builds `ai-gateway.yaml` and renders every chart with `helm template` in Docker. Commit both the sources and the generated file.
