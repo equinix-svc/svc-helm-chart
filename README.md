@@ -35,7 +35,7 @@ ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
 Both templates are the Equinix Network Edge Day 0 for the unchanged `k3s-node.qcow2` (portal settings in `docs/portal-values.md` of svc-ne-byoi-builder). They do what that image's own Day 0 does (hostname, static network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
 
 1. generate the two Secrets (see 6. How it works) with random values, except the keys you pass in, and write the ones you need to `/etc/ai-gateway/credentials.env` (root only);
-2. download `ai-gateway.yaml` and the chat page manifest (`examples/chat-ui/chat-ui.yaml`) from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s deploys them.
+2. download `ai-gateway.yaml` and the chat page manifest (`chat-ui.yaml`) from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s deploys them.
 
 | Template | Use | Portal parameters |
 |---|---|---|
@@ -72,7 +72,7 @@ ACL: allow 22 and 80/443. Langfuse, Qdrant and S3 are not exposed.
 
 | Interface | URL | Access | Login |
 |---|---|---|---|
-| Chat page (example, section 5) | `https://<node>/chat/` | public, once applied | a LiteLLM key, pasted in the page |
+| Chat page (section 5) | `https://<node>/chat/` | public, once applied | a LiteLLM key, pasted in the page |
 | LiteLLM admin UI | `https://<node>/ui/` | public | user `admin`, password = `LITELLM_MASTER_KEY` (default login) |
 | LiteLLM API docs (Swagger) | `https://<node>/` | public | API calls: `Authorization: Bearer <key>` on `/v1/...` |
 | Langfuse (traces) | `http://localhost:3000` | SSH tunnel | `LANGFUSE_ADMIN_EMAIL` / `LANGFUSE_ADMIN_PASSWORD` |
@@ -89,20 +89,20 @@ ssh -L 3000:localhost:3000 <user>@<node> "sudo k3s kubectl -n ai-gateway port-fo
 # Qdrant: svc/qdrant 6333    SeaweedFS filer: svc/langfuse-s3-all-in-one 8888    rag-service: svc/rag-service 8000
 ```
 
-## 5. Chat page (example)
+## 5. Chat page
 
-[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file served by nginx, behind the same Traefik. Day 0 installs it with the stack; it is a separate manifest, not part of `ai-gateway.yaml`. It ships as its own container image, built by the `chat-ui-image` GitHub workflow on every change under `examples/chat-ui/`.
+[`src/chat-ui/`](src/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file served by nginx, behind the same Traefik. Day 0 installs it with the stack; it is a separate manifest, not part of `ai-gateway.yaml`. It ships as its own container image, built by the `images` GitHub workflow on every change under `src/chat-ui/`.
 
 | Item | Detail |
 |---|---|
 | Image | `ghcr.io/equinix-svc/svc-helm-daihub/chat-ui:0.1.0` (nginx 1.27 with the page baked in) |
-| Install | Day 0 does it. On a node created before, run `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
+| Install | Day 0 does it. On a node created before, run `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/chat-ui.yaml` |
 | Private package | Day 0 sets `REGISTRY_USER` and `REGISTRY_TOKEN` (section 3). On a node created before, create the pull secret first: `sudo k3s kubectl -n ai-gateway create secret docker-registry ghcr-pull --docker-server=ghcr.io --docker-username=<user> --docker-password=<token with read:packages>`. Not needed once the package is public. |
 | Open | `https://<node>/chat/`, paste a LiteLLM key (the master key, or a virtual key from the admin UI) |
 | Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection. Each answer shows which real model served it (e.g. `groq/qwen/qwen3.8-27b` or `gemini/gemini-3.5-flash-lite` behind `llm-pool`), tokens, latency, cost and the guardrails applied |
-| Update | push a change under `examples/chat-ui/`, then on the node `sudo k3s kubectl -n ai-gateway rollout restart deploy/chat-ui` (the manifest pulls the image again) |
+| Update | push a change under `src/chat-ui/`, then on the node `sudo k3s kubectl -n ai-gateway rollout restart deploy/chat-ui` (the manifest pulls the image again) |
 | Remove | `sudo k3s kubectl delete -f` the same URL |
-| Sources | `index.html`, `default.conf`, `Dockerfile`, `chat-ui.yaml` |
+| Sources | `src/chat-ui/` (`index.html`, `default.conf`, `Dockerfile`) and the manifest `chat-ui.yaml` |
 
 The key stays in the browser tab (`sessionStorage`) and goes only to the same host. Tested on the node: the PII sample came back with `<PERSON>`, `<EMAIL_ADDRESS>` and `<PHONE_NUMBER>`, the secret sample was masked, and the injection sample was blocked by LLM Guard (HTTP 400).
 

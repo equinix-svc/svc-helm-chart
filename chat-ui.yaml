@@ -1,9 +1,9 @@
-# EXAMPLE (optional): a light chat page to test the AI gateway end to end, at https://<node>/chat/
+# Light chat page to test the AI gateway end to end, at https://<node>/chat/
 # Apply on the node:
-#   sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml
+#   sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/chat-ui.yaml
 # Remove: sudo k3s kubectl delete -f <same url>
-# The image (nginx + one static HTML page) is built from examples/chat-ui/ by the "chat-ui-image" GitHub workflow.
-# If the package is private, create the pull secret first (see README, section 5). The page calls LiteLLM on the same
+# The image (nginx + one static HTML page) is built from src/chat-ui/ by the "images" GitHub workflow.
+# Day 0 installs it with the stack and sets the registry credentials (REGISTRY_USER, REGISTRY_TOKEN). The page calls LiteLLM on the same
 # host (/v1/chat/completions) with the key you paste in it.
 apiVersion: apps/v1
 kind: Deployment

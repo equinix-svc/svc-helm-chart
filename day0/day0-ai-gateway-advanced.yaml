@@ -131,7 +131,7 @@ write_files:
         echo "$2 installed in $MAN (ref $REF); k3s will deploy it"
       }
       fetch ai-gateway.yaml ai-gateway.yaml
-      fetch examples/chat-ui/chat-ui.yaml chat-ui.yaml
+      fetch chat-ui.yaml chat-ui.yaml
 
   - path: /usr/local/bin/day0-bootstrap.sh
     owner: root:root
