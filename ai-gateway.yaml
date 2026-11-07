@@ -712,6 +712,9 @@ spec:
           secretKeyRef: { name: ai-secrets, key: LANGFUSE_NEXTAUTH_SECRET }
       # First user, organisation and project (with API keys) created at startup
       additionalEnv:
+        # Service "redis" makes Kubernetes inject REDIS_PORT=tcp://<ip>:6379 into every Pod; Langfuse parses REDIS_PORT as a number
+        # and crashes (ZodError NaN). An explicit value overrides the injected one.
+        - { name: REDIS_PORT, value: "6379" }
         - { name: LANGFUSE_INIT_ORG_ID, value: ai-gateway }
         - { name: LANGFUSE_INIT_ORG_NAME, value: AI Gateway }
         - { name: LANGFUSE_INIT_PROJECT_ID, value: ai-gateway }
