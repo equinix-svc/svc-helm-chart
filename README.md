@@ -1,4 +1,4 @@
-# svc-helm-chart
+# svc-helm-daihub
 
 AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the
 plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network

@@ -8,7 +8,7 @@
 #                       GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
 #                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN   (all optional)
 # AI gateway variant. Uses the plain k3s-node image: on a single node or the first server, once k3s is Ready,
-# it generates the stack secrets, downloads ai-gateway.yaml from github.com/equinix-svc/svc-helm-chart
+# it generates the stack secrets, downloads ai-gateway.yaml from github.com/equinix-svc/svc-helm-daihub
 # (branch or tag STACK_REF, default main; STACK_TOKEN is only for a private fork) into the
 # k3s manifests directory, and k3s's Helm controller deploys LiteLLM, Langfuse, Presidio, LLM Guard, Qdrant and
 # the RAG service. Needs outbound internet at first boot. Credentials: /etc/ai-gateway/credentials.env (root).
@@ -118,7 +118,7 @@ write_files:
       [ -n "${STACK_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $STACK_TOKEN")
       for i in 1 2 3 4 5 6; do
         curl -fsSL --retry 3 "${AUTH[@]}" -H "Accept: application/vnd.github.raw" \
-          "https://api.github.com/repos/equinix-svc/svc-helm-chart/contents/ai-gateway.yaml?ref=$REF" \
+          "https://api.github.com/repos/equinix-svc/svc-helm-daihub/contents/ai-gateway.yaml?ref=$REF" \
           -o "$MAN/ai-gateway.yaml" && break
         echo "download failed (try $i), retrying"; sleep 20
       done
