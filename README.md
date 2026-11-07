@@ -1,5 +1,7 @@
 # svc-helm-daihub
 
+<img src="assets/logo.svg" alt="DAI Hub" width="120">
+
 AI gateway stack for a single k3s node, as **one file**: [`ai-gateway.yaml`](ai-gateway.yaml). It runs on the plain `k3s-node` image of [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder) (Equinix Network Edge BYOI) and works on any k3s with Traefik and the local-path StorageClass. There are no custom container images and no registry to maintain. It has been validated statically (section 7) but **not yet deployed on a device**, so first-boot behaviour is untested.
 
 ## 1. Stack
