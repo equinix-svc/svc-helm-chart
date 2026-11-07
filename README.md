@@ -99,8 +99,8 @@ Equinix predefined: `hostname` `userName` `publicKey` `adminPwd` `ipAddressWithC
 | `LANGFUSE_ADMIN_EMAIL` | no | `admin@example.com` | Langfuse first user. Default `admin@ai-gateway.local`. |
 | `LANGFUSE_ADMIN_PASSWORD` | no | `ChangeMe-2026` | Langfuse first user password. Generated when empty. |
 | `K3S_ROLE` | no | `single` | `single` (default): standalone node. `server`: control-plane node. `agent`: k3s worker node that joins an existing cluster; the stack is not installed on it. |
-| `K3S_SERVER_URL` | no (only used for agent) | `https://10.0.0.5:6443` | URL used by an agent to join the k3s cluster. Empty for `single` or the first `server`. |
-| `K3S_TOKEN` | no (only used for agent) | `K10abc123def456::server:789xyz` | Secret used to join the k3s cluster. |
+| `K3S_SERVER_URL` | no (agent only) | `https://10.0.0.5:6443` | URL used by an agent to join the k3s cluster. Empty for `single` or the first `server`. |
+| `K3S_TOKEN` | no (agent only) | `K10abc123def456::server:789xyz` | Secret used to join the k3s cluster. |
 | `K3S_TLS_SAN` | no | `203.0.113.20` | Extra API certificate name or IP. |
 | `STACK_REF` | no | `main` | Branch or tag of this repo to fetch. Pin a tag for repeatable boots. |
 | `STACK_TOKEN` | no | `github_pat_11ABCDEF0xxxxxxxx` | Read-only GitHub token, only for a private fork. |
