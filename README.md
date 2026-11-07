@@ -95,7 +95,7 @@ ssh -L 3000:localhost:3000 <user>@<node> "sudo k3s kubectl -n ai-gateway port-fo
 |---|---|
 | Install | `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
 | Open | `https://<node>/chat/`, paste a LiteLLM key (the master key, or a virtual key from the admin UI) |
-| Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection |
+| Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection. Each answer shows which real model served it (e.g. `groq/qwen/qwen3.8-27b` or `gemini/gemini-3.5-flash-lite` behind `llm-pool`), tokens, latency, cost and the guardrails applied |
 | Remove | `sudo k3s kubectl delete -f` the same URL |
 | Sources | `index.html`, `default.conf`, `chat-ui.yaml.in`; `scripts/build.py` generates `chat-ui.yaml` |
 

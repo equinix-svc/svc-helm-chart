@@ -59,6 +59,7 @@ const API = new URLSearchParams(location.search).get('api') || '';      // empty
 const $ = s => document.querySelector(s);
 const log = $('#log'), keyEl = $('#key'), modelEl = $('#model'), ragEl = $('#rag'), textEl = $('#text'), sendEl = $('#send');
 let history = [];
+let backends = {};                       // model id -> real model behind the pool, e.g. groq/qwen/qwen3.8-27b
 
 const SAMPLES = [
   ['Hello', 'Say hello in three words.'],
@@ -90,6 +91,17 @@ async function loadModels() {
     const ids = (await r.json()).data.map(m => m.id);
     if (ids.length) { modelEl.innerHTML = ''; ids.forEach(i => modelEl.add(new Option(i, i))); if (ids.includes('llm-pool')) modelEl.value = 'llm-pool'; }
   } catch (e) { /* keep the default */ }
+  try {                                  // which real model sits behind each deployment id (used to show who answered)
+    const r = await fetch(API + '/v1/model/info', {headers: headers()}); if (!r.ok) return;
+    backends = {};
+    (await r.json()).data.forEach(m => { if (m.model_info && m.model_info.id) backends[m.model_info.id] = m.litellm_params.model; });
+  } catch (e) { /* fall back to the API host */ }
+}
+
+function servedBy(r) {
+  const id = r.headers.get('x-litellm-model-id'), base = r.headers.get('x-litellm-model-api-base') || '';
+  if (id && backends[id]) return backends[id];
+  try { return base ? new URL(base).host : ''; } catch (e) { return base; }
 }
 
 async function send() {
@@ -111,8 +123,11 @@ async function send() {
     } else {
       const reply = data.choices[0].message.content || '';
       history.push({role: 'assistant', content: reply});
-      const u = data.usage || {}, g = r.headers.get('x-litellm-applied-guardrails');
-      add('bot', reply, [data.model, (u.total_tokens || '?') + ' tokens', Math.round(performance.now() - t0) + ' ms', g ? 'guardrails: ' + g : ''].filter(Boolean).join(' · '));
+      const u = data.usage || {}, g = r.headers.get('x-litellm-applied-guardrails'), cost = parseFloat(r.headers.get('x-litellm-response-cost'));
+      const who = servedBy(r);
+      add('bot', reply, [who ? 'served by ' + who + (modelEl.value ? ' (via ' + modelEl.value + ')' : '') : data.model,
+        (u.total_tokens || '?') + ' tokens', Math.round(performance.now() - t0) + ' ms', isNaN(cost) ? '' : '$' + cost.toFixed(5),
+        g ? 'guardrails: ' + g : ''].filter(Boolean).join(' · '));
     }
   } catch (e) { wait.remove(); history.pop(); add('err', 'Cannot reach the API: ' + e.message); }
   sendEl.disabled = false; textEl.focus();
