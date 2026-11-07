@@ -1,0 +1,21 @@
+name: chat-ui-image
+on:
+  push:
+    branches: [main]
+    paths: ['examples/chat-ui/**', '.github/workflows/chat-ui-image.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: docker/build-push-action@v6
+        with:
+          context: examples/chat-ui
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/chat-ui:0.1.0
+            ghcr.io/${{ github.repository }}/chat-ui:sha-${{ github.sha }}

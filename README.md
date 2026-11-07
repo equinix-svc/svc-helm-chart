@@ -89,15 +89,18 @@ ssh -L 3000:localhost:3000 <user>@<node> "sudo k3s kubectl -n ai-gateway port-fo
 
 ## 5. Chat page (example)
 
-[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file (no build, no external script) served by nginx, behind the same Traefik. It is optional and not part of `ai-gateway.yaml`.
+[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file served by nginx, behind the same Traefik. It is optional and not part of `ai-gateway.yaml`. It ships as its own container image, built by the `chat-ui-image` GitHub workflow on every change under `examples/chat-ui/`.
 
 | Item | Detail |
 |---|---|
+| Image | `ghcr.io/equinix-svc/svc-helm-daihub/chat-ui:0.1.0` (nginx 1.27 with the page baked in) |
 | Install | `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
+| Private package | Create the pull secret first: `sudo k3s kubectl -n ai-gateway create secret docker-registry ghcr-pull --docker-server=ghcr.io --docker-username=<user> --docker-password=<token with read:packages>`. Not needed once the package is public. |
 | Open | `https://<node>/chat/`, paste a LiteLLM key (the master key, or a virtual key from the admin UI) |
 | Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection. Each answer shows which real model served it (e.g. `groq/qwen/qwen3.8-27b` or `gemini/gemini-3.5-flash-lite` behind `llm-pool`), tokens, latency, cost and the guardrails applied |
+| Update | push a change under `examples/chat-ui/`, then on the node `sudo k3s kubectl -n ai-gateway rollout restart deploy/chat-ui` (the manifest pulls the image again) |
 | Remove | `sudo k3s kubectl delete -f` the same URL |
-| Sources | `index.html`, `default.conf`, `chat-ui.yaml.in`; `scripts/build.py` generates `chat-ui.yaml` |
+| Sources | `index.html`, `default.conf`, `Dockerfile`, `chat-ui.yaml` |
 
 The key stays in the browser tab (`sessionStorage`) and goes only to the same host. Tested on the node: the PII sample came back with `<PERSON>`, `<EMAIL_ADDRESS>` and `<PHONE_NUMBER>`, the secret sample was masked, and the injection sample was blocked by LLM Guard (HTTP 400).
 
