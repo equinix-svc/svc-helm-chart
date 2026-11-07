@@ -23,33 +23,42 @@ Only LiteLLM is exposed, on 80/443 through Traefik. Everything else stays inside
 |---|---|
 | 1. VM image | Plain `k3s-node` image (`k3s-node.qcow2`) from [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder). Portal settings: `docs/portal-values.md` in that repo. |
 | 2. Container images | None to build: all images are public. |
-| 3. Day 0 file | [`day0/day0-ai-gateway.yaml`](day0/day0-ai-gateway.yaml). |
-| 4. Parameters | None is strictly required. Set `GROQ_API_KEY` and `GEMINI_API_KEY` for the models to answer. Full list: [Day 0 parameters](#3-day-0-parameters). |
+| 3. Day 0 file | [`day0/day0-ai-gateway-basic.yaml`](day0/day0-ai-gateway-basic.yaml) for a single node with two parameters, [`day0/day0-ai-gateway-advanced.yaml`](day0/day0-ai-gateway-advanced.yaml) to join a cluster or set credentials. |
+| 4. Parameters | BASIC: `GROQ_API_KEY` and `GEMINI_API_KEY`, none strictly required (set them for the models to answer). Full list: [Day 0 templates](#3-day-0-templates). |
 
 ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
 
-## 3. Day 0 parameters
+## 3. Day 0 templates
 
-[`day0/day0-ai-gateway.yaml`](day0/day0-ai-gateway.yaml) is the Equinix Network Edge Day 0 template for the unchanged `k3s-node.qcow2` (portal settings in `docs/portal-values.md` of svc-ne-byoi-builder). It does what that image's own Day 0 does (hostname, static network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
+Both templates are the Equinix Network Edge Day 0 for the unchanged `k3s-node.qcow2` (portal settings in `docs/portal-values.md` of svc-ne-byoi-builder). They do what that image's own Day 0 does (hostname, static network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
 
-1. generates the two Secrets (see 4. How it works) (random values, except the keys you pass in) and writes the ones you need to `/etc/ai-gateway/credentials.env` (root only);
-2. downloads `ai-gateway.yaml` from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s's Helm controller deploys it.
+1. generate the two Secrets (see 4. How it works) with random values, except the keys you pass in, and write the ones you need to `/etc/ai-gateway/credentials.env` (root only);
+2. download `ai-gateway.yaml` from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s's Helm controller deploys it.
 
-Equinix predefined: `hostname` `userName` `publicKey` `adminPwd` `ipAddressWithCidr` `gateway`. Declare every other variable as a custom parameter in the portal. Render locally with `scripts/render-day0.sh`. Log: `/var/log/day0.log`.
+| Template | Use | Portal parameters |
+|---|---|---|
+| [`day0/day0-ai-gateway-basic.yaml`](day0/day0-ai-gateway-basic.yaml) | **BASIC**: single node, everything else fixed or generated | 2, both optional |
+| [`day0/day0-ai-gateway-advanced.yaml`](day0/day0-ai-gateway-advanced.yaml) | **ADVANCED**: cluster join, chosen credentials, pinned repo version | 11, all optional |
 
-| Parameter | Required | Example (paste in the portal) | Meaning |
-|---|---|---|---|
-| `GROQ_API_KEY` | for Groq models | `gsk_AbCdEf1234567890` | Groq API key. |
-| `GEMINI_API_KEY` | for Gemini models | `AIzaSyAbCdEf1234567890` | Gemini API key. |
-| `LITELLM_MASTER_KEY` | no | `sk-lab-0123456789abcdef` | LiteLLM admin key. Generated when empty. |
-| `LANGFUSE_ADMIN_EMAIL` | no | `admin@example.com` | Langfuse first user. Default `admin@ai-gateway.local`. |
-| `LANGFUSE_ADMIN_PASSWORD` | no | `ChangeMe-2026` | Langfuse first user password. Generated when empty. |
-| `K3S_ROLE` | no | `single` | `single` (default): standalone node. `server`: control-plane node. `agent`: k3s worker node that joins an existing cluster; the stack is not installed on it. |
-| `K3S_SERVER_URL` | no (agent only) | `https://10.0.0.5:6443` | URL used by an agent to join the k3s cluster. Empty for `single` or the first `server`. |
-| `K3S_TOKEN` | no (agent only) | `K10abc123def456::server:789xyz` | Secret used to join the k3s cluster. |
-| `K3S_TLS_SAN` | no | `203.0.113.20` | Extra API certificate name or IP. |
-| `STACK_REF` | no | `main` | Branch or tag of this repo to fetch. Pin a tag for repeatable boots. |
-| `STACK_TOKEN` | no | `github_pat_11ABCDEF0xxxxxxxx` | Read-only GitHub token, only for a private fork. |
+Equinix predefined (both): `hostname` `userName` `publicKey` `adminPwd` `ipAddressWithCidr` `gateway`. Declare every other variable as a custom parameter in the portal. Render locally with `DAY0_FILE=<file> scripts/render-day0.sh`. Log: `/var/log/day0.log`.
+
+### Parameters
+
+The **BASIC** and **ADVANCED** columns show whether the parameter is required in that template: `yes`, `no`, or `-` (not used). **Default** is what the template uses when a parameter that is not required is left empty. BASIC fixes the unused ones to their default.
+
+| Parameter | BASIC | ADVANCED | Default | Example (paste in the portal) | Meaning |
+|---|---|---|---|---|---|
+| `GROQ_API_KEY` | no (for Groq models) | no (for Groq models) | empty | `gsk_AbCdEf1234567890` | Groq API key. |
+| `GEMINI_API_KEY` | no (for Gemini models) | no (for Gemini models) | empty | `AIzaSyAbCdEf1234567890` | Gemini API key. |
+| `LITELLM_MASTER_KEY` | - | no | generated | `sk-lab-0123456789abcdef` | LiteLLM admin key. |
+| `LANGFUSE_ADMIN_EMAIL` | - | no | `admin@ai-gateway.local` | `admin@example.com` | Langfuse first user. |
+| `LANGFUSE_ADMIN_PASSWORD` | - | no | generated | `ChangeMe-2026` | Langfuse first user password. |
+| `K3S_ROLE` | - | no | `single` | `single` | `single`: standalone node. `server`: control-plane node. `agent`: k3s worker node that joins an existing cluster; the stack is not installed on it. |
+| `K3S_SERVER_URL` | - | no (agent only) | empty | `https://10.0.0.5:6443` | URL used by an agent to join the k3s cluster. Empty for `single` or the first `server`. |
+| `K3S_TOKEN` | - | no (agent only) | empty | `K10abc123def456::server:789xyz` | Secret used to join the k3s cluster. |
+| `K3S_TLS_SAN` | - | no | empty | `203.0.113.20` | Extra API certificate name or IP. |
+| `STACK_REF` | - | no | `main` | `main` | Branch or tag of this repo to fetch. Pin a tag for repeatable boots. |
+| `STACK_TOKEN` | - | no | empty | `github_pat_11ABCDEF0xxxxxxxx` | Read-only GitHub token, only for a private fork. |
 
 ACL: allow 22 and 80/443. Langfuse, Qdrant and S3 are not exposed.
 
@@ -103,7 +112,7 @@ sudo k3s kubectl -n ai-gateway exec deploy/rag-service -- python -c \
 - The Qdrant (1.20.0), Langfuse (2.2.3) and LiteLLM (1.108.0) charts render with `helm template` using the values in this file, and every image they use exists (`scripts/validate.sh`).
 - A throwaway k3s accepted all 28 resources, including the three `HelmChart`s, in a server-side dry run.
 - The LiteLLM guardrail modules import under the real LiteLLM 1.108.0 image, and their hook signatures match.
-- Day 0 (about 12 KB) renders and passes a shell syntax check.
+- Both Day 0 templates (about 12 KB each) render and pass a shell syntax check.
 
 ## 8. Findings and limits
 
