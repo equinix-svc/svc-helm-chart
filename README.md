@@ -24,9 +24,9 @@ Only LiteLLM is exposed, on 80/443 through Traefik. Everything else stays inside
 | Step | What |
 |---|---|
 | 1. VM image | Plain `k3s-node` image (`k3s-node.qcow2`) from [svc-ne-byoi-builder](https://github.com/equinix-svc/svc-ne-byoi-builder). Portal settings: `docs/portal-values.md` in that repo. |
-| 2. Container images | None to build: all images are public. |
+| 2. Container images | The stack uses public images. The chat page image `ghcr.io/equinix-svc/svc-helm-daihub/chat-ui:0.1.0` is private: the node pulls it with `REGISTRY_USER` and `REGISTRY_TOKEN` (required). |
 | 3. Day 0 file | [`day0/day0-ai-gateway-basic.yaml`](day0/day0-ai-gateway-basic.yaml) for a single node with two parameters, [`day0/day0-ai-gateway-advanced.yaml`](day0/day0-ai-gateway-advanced.yaml) to join a cluster or set credentials. |
-| 4. Parameters | BASIC: `GROQ_API_KEY` and `GEMINI_API_KEY`, none strictly required (set them for the models to answer); `REGISTRY_USER` and `REGISTRY_TOKEN` only for private images. Full list: [Day 0 templates](#3-day-0-templates). |
+| 4. Parameters | BASIC: `REGISTRY_USER` and `REGISTRY_TOKEN` (required), `GROQ_API_KEY` and `GEMINI_API_KEY` (set them for the models to answer). Full list: [Day 0 templates](#3-day-0-templates). |
 
 ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
 
@@ -35,12 +35,12 @@ ACL: allow 22 and 80/443. First start takes about 10 minutes (see First start).
 Both templates are the Equinix Network Edge Day 0 for the unchanged `k3s-node.qcow2` (portal settings in `docs/portal-values.md` of svc-ne-byoi-builder). They do what that image's own Day 0 does (hostname, static network, portal user, k3s), then on a `single` node or the first `server`, once k3s is Ready:
 
 1. generate the two Secrets (see 6. How it works) with random values, except the keys you pass in, and write the ones you need to `/etc/ai-gateway/credentials.env` (root only);
-2. download `ai-gateway.yaml` from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s's Helm controller deploys it.
+2. download `ai-gateway.yaml` and the chat page manifest (`examples/chat-ui/chat-ui.yaml`) from this repo into `/var/lib/rancher/k3s/server/manifests/`, where k3s deploys them.
 
 | Template | Use | Portal parameters |
 |---|---|---|
-| [`day0/day0-ai-gateway-basic.yaml`](day0/day0-ai-gateway-basic.yaml) | **BASIC**: single node, everything else fixed or generated | 4, all optional |
-| [`day0/day0-ai-gateway-advanced.yaml`](day0/day0-ai-gateway-advanced.yaml) | **ADVANCED**: cluster join, chosen credentials, pinned repo version | 13, all optional |
+| [`day0/day0-ai-gateway-basic.yaml`](day0/day0-ai-gateway-basic.yaml) | **BASIC**: single node, everything else fixed or generated | 4, 2 required |
+| [`day0/day0-ai-gateway-advanced.yaml`](day0/day0-ai-gateway-advanced.yaml) | **ADVANCED**: cluster join, chosen credentials, pinned repo version | 13, 2 required |
 
 Equinix predefined (both): `hostname` `userName` `publicKey` `adminPwd` `ipAddressWithCidr` `gateway`. Declare every other variable as a custom parameter in the portal. Render locally with `DAY0_FILE=<file> scripts/render-day0.sh`. Log: `/var/log/day0.log`.
 
@@ -61,8 +61,8 @@ The **BASIC** and **ADVANCED** columns show whether the parameter is required in
 | `K3S_TLS_SAN` | - | no | empty | `203.0.113.20` | Extra name or IP in the k3s API server certificate, for `kubectl` or agents reaching port 6443 from outside. Not needed for local `sudo k3s kubectl`. |
 | `STACK_REF` | - | no | `main` | `main` | Branch or tag of this repo to fetch. Pin a tag for repeatable boots. |
 | `STACK_TOKEN` | - | no | empty | `github_pat_11ABCDEF0xxxxxxxx` | Read-only GitHub token, only for a private fork. |
-| `REGISTRY_USER` | no | no | empty | `my-github-user` | GitHub login used to pull private images from ghcr.io (the chat page image). Leave empty when the packages are public. |
-| `REGISTRY_TOKEN` | no | no | empty | `ghp_AbCdEf1234567890AbCdEf1234567890AbCd` | Classic personal access token with only `read:packages`. Written to `/etc/rancher/k3s/registries.yaml` (root only) before k3s starts. Expires: set a reminder to rotate it. |
+| `REGISTRY_USER` | yes | yes | - | `my-github-user` | GitHub login used to pull the private chat page image from ghcr.io. Day 0 stops the stack install without it. |
+| `REGISTRY_TOKEN` | yes | yes | - | `ghp_AbCdEf1234567890AbCdEf1234567890AbCd` | Classic personal access token with only `read:packages`. Written to `/etc/rancher/k3s/registries.yaml` (root only) before k3s starts. Expires: set a reminder to rotate it. |
 
 ACL: allow 22 and 80/443. Langfuse, Qdrant and S3 are not exposed.
 
@@ -91,13 +91,13 @@ ssh -L 3000:localhost:3000 <user>@<node> "sudo k3s kubectl -n ai-gateway port-fo
 
 ## 5. Chat page (example)
 
-[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file served by nginx, behind the same Traefik. It is optional and not part of `ai-gateway.yaml`. It ships as its own container image, built by the `chat-ui-image` GitHub workflow on every change under `examples/chat-ui/`.
+[`examples/chat-ui/`](examples/chat-ui/) is a light chat page to test the gateway end to end: one static HTML file served by nginx, behind the same Traefik. Day 0 installs it with the stack; it is a separate manifest, not part of `ai-gateway.yaml`. It ships as its own container image, built by the `chat-ui-image` GitHub workflow on every change under `examples/chat-ui/`.
 
 | Item | Detail |
 |---|---|
 | Image | `ghcr.io/equinix-svc/svc-helm-daihub/chat-ui:0.1.0` (nginx 1.27 with the page baked in) |
-| Install | `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
-| Private package | Set `REGISTRY_USER` and `REGISTRY_TOKEN` in Day 0 (section 3), or on a running node create the pull secret first: `sudo k3s kubectl -n ai-gateway create secret docker-registry ghcr-pull --docker-server=ghcr.io --docker-username=<user> --docker-password=<token with read:packages>`. Not needed once the package is public. |
+| Install | Day 0 does it. On a node created before, run `sudo k3s kubectl apply -f https://raw.githubusercontent.com/equinix-svc/svc-helm-daihub/main/examples/chat-ui/chat-ui.yaml` |
+| Private package | Day 0 sets `REGISTRY_USER` and `REGISTRY_TOKEN` (section 3). On a node created before, create the pull secret first: `sudo k3s kubectl -n ai-gateway create secret docker-registry ghcr-pull --docker-server=ghcr.io --docker-username=<user> --docker-password=<token with read:packages>`. Not needed once the package is public. |
 | Open | `https://<node>/chat/`, paste a LiteLLM key (the master key, or a virtual key from the admin UI) |
 | Features | model list from `/v1/models`, RAG switch (`rag-augment` guardrail), sample prompts for PII masking, secret redaction and prompt injection. Each answer shows which real model served it (e.g. `groq/qwen/qwen3.8-27b` or `gemini/gemini-3.5-flash-lite` behind `llm-pool`), tokens, latency, cost and the guardrails applied |
 | Update | push a change under `examples/chat-ui/`, then on the node `sudo k3s kubectl -n ai-gateway rollout restart deploy/chat-ui` (the manifest pulls the image again) |

@@ -6,7 +6,7 @@
 #   Equinix predefined: hostname userName publicKey adminPwd ipAddressWithCidr gateway
 #   Custom parameters : K3S_ROLE K3S_SERVER_URL K3S_TOKEN K3S_TLS_SAN
 #                       GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
-#                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN REGISTRY_USER REGISTRY_TOKEN   (all optional)
+#                       LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN REGISTRY_USER REGISTRY_TOKEN   (REGISTRY_* required, the rest optional)
 # AI gateway variant. Uses the plain k3s-node image: on a single node or the first server, once k3s is Ready,
 # it generates the stack secrets, downloads ai-gateway.yaml from github.com/equinix-svc/svc-helm-daihub
 # (branch or tag STACK_REF, default main; STACK_TOKEN is only for a private fork) into the
@@ -80,8 +80,11 @@ write_files:
     content: |
       #!/usr/bin/env bash
       # Called by day0-bootstrap.sh with GROQ_API_KEY GEMINI_API_KEY LITELLM_MASTER_KEY LANGFUSE_ADMIN_EMAIL
-      # LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN in the environment (all optional).
+      # LANGFUSE_ADMIN_PASSWORD STACK_REF STACK_TOKEN in the environment (optional) and REGISTRY_USER REGISTRY_TOKEN (required).
       set -euo pipefail
+      for v in REGISTRY_USER REGISTRY_TOKEN; do
+        [ -n "${!v:-}" ] || { echo "missing required parameter $v (the chat page image on ghcr.io is private)"; exit 1; }
+      done
       K="/usr/local/bin/k3s kubectl"
       MAN=/var/lib/rancher/k3s/server/manifests
       REF="${STACK_REF:-main}"
@@ -118,14 +121,17 @@ write_files:
 
       AUTH=()
       [ -n "${STACK_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $STACK_TOKEN")
-      for i in 1 2 3 4 5 6; do
-        curl -fsSL --retry 3 "${AUTH[@]}" -H "Accept: application/vnd.github.raw" \
-          "https://api.github.com/repos/equinix-svc/svc-helm-daihub/contents/ai-gateway.yaml?ref=$REF" \
-          -o "$MAN/ai-gateway.yaml" && break
-        echo "download failed (try $i), retrying"; sleep 20
-      done
-      [ -s "$MAN/ai-gateway.yaml" ] || { echo "could not download ai-gateway.yaml"; exit 1; }
-      echo "ai-gateway.yaml installed in $MAN (ref $REF); k3s will deploy it"
+      fetch() {   # fetch <path in repo> <file name in the manifests directory>
+        for i in 1 2 3 4 5 6; do
+          curl -fsSL --retry 3 "${AUTH[@]}" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/equinix-svc/svc-helm-daihub/contents/$1?ref=$REF" -o "$MAN/$2" && break
+          echo "download of $1 failed (try $i), retrying"; sleep 20
+        done
+        [ -s "$MAN/$2" ] || { echo "could not download $1"; exit 1; }
+        echo "$2 installed in $MAN (ref $REF); k3s will deploy it"
+      }
+      fetch ai-gateway.yaml ai-gateway.yaml
+      fetch examples/chat-ui/chat-ui.yaml chat-ui.yaml
 
   - path: /usr/local/bin/day0-bootstrap.sh
     owner: root:root
@@ -257,7 +263,8 @@ write_files:
         echo "installing the AI gateway stack"
         GROQ_API_KEY="$GROQ_API_KEY" GEMINI_API_KEY="$GEMINI_API_KEY" LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY" \
         LANGFUSE_ADMIN_EMAIL="$LANGFUSE_ADMIN_EMAIL" LANGFUSE_ADMIN_PASSWORD="$LANGFUSE_ADMIN_PASSWORD" \
-        STACK_REF="$STACK_REF" STACK_TOKEN="$STACK_TOKEN" /usr/local/bin/day0-ai-stack.sh \
+        STACK_REF="$STACK_REF" STACK_TOKEN="$STACK_TOKEN" \
+        REGISTRY_USER="$REGISTRY_USER" REGISTRY_TOKEN="$REGISTRY_TOKEN" /usr/local/bin/day0-ai-stack.sh \
           || echo "AI gateway install failed: see this log"
       fi
 
